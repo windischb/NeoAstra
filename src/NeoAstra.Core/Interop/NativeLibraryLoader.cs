@@ -74,6 +74,12 @@ internal static class NativeLibraryLoader
             return 0;
         }
 
+        // An iOS application links the native library statically into its executable, so its symbols belong to the main program.
+        if (OperatingSystem.IsIOS())
+        {
+            return NativeLibrary.GetMainProgramHandle();
+        }
+
         lock (Sync)
         {
             if (_loadedHandle != 0)
