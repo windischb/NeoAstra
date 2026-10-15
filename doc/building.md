@@ -78,6 +78,22 @@ The managed project directly copies the staged library for the current host RID 
 
 Native tests include a public-header ABI test, common ownership tests, contended dispatch/UI-object teardown stress tests, and an independent frozen ABI 1.7 consumer. The frozen consumer does not include the current header: it loads the shared library by path, verifies every ABI 1.7 export, calls core entry points through frozen C-layout declarations, and performs an attach/detach ownership cycle. Compatible exports added after ABI 1.7 do not change that export floor. On macOS and Linux the native tests also check which WebKit data store or network session each user-data root and profile selects; those tests create browser views and use WebKit's cookie storage, but load no page. On Linux they check as well that a destroyed view leaves its window, and that the settings of a view for the Tab key and for history navigation reach WebKitGTK. On macOS a further test loads `data:` pages in a hidden window and checks that a view reports whether it can go back and forward as its history changes, that a navigation request tells a new document, a reload, and an entry of the history apart, and that a view whose history navigation is turned off stays on its page and still reloads it; another one hands key presses and clicks to such a view: it checks that the Tab key stops on a link only while the view is set to, that a link is reported as user-initiated when the user activates it and not when a script does, and that an address sent outside the view reaches the system only when it is a web address. That test takes the place of `NSWorkspace`, so no browser opens. A last one zooms such a view and checks that its page is laid out again in a viewport of the size of the view divided by the zoom and still fills the view, and that a view keeps its zoom from before its first document on, through a new document and a reload.
 
+### iOS native library (preview)
+
+The iOS backend is a static library, because an iOS application cannot load a library of its own at run time. Only the application level is implemented so far: an application attaches to the run loop of UIKit, and windows, views, and profiles report `NEOASTRA_ERROR_NOT_SUPPORTED`. Build it on macOS with Xcode:
+
+```sh
+cmake --preset iossimulator-arm64-release && cmake --build artifacts/native/iossimulator-arm64-release
+cmake --preset ios-arm64-release && cmake --build artifacts/native/ios-arm64-release
+```
+
+The presets build no tests, since an iOS library cannot run on the host, and `eng/build_native.py` does not stage it yet. An application links the library and has to say which exports it uses, because the linker removes what no code references and strips the rest from a device build:
+
+- Add the library as `<NativeReference Include="libneoastra_native.a" Kind="Static" ForceLoad="true" SmartLink="false" />`.
+- Add one `<ReferenceNativeSymbol Include="neoastra_app_attach" SymbolType="Function" />` for every `neoastra_` export, without a leading underscore.
+
+`NeoAstra.Core` resolves its imports in the main program on iOS (`NativeLibrary.GetMainProgramHandle`). A project reference to `NeoAstra.Core` also copies the library of the host into an iOS application, which the linker rejects; leave it out of the publish items of the application.
+
 ## Frontend checks
 
 From the repository root, build and verify the frontend package, CSP/bootstrap fixtures, framework consumers, size budget, licenses, provenance, and publish contents with:
