@@ -809,6 +809,10 @@ void neo_download_emit(neoastra_download_t* download, neoastra_event_type_t type
 void neo_finish_decision_event(neoastra_app_t* app, neoastra_decision_t* decision) noexcept;
 inline void neo_finish_decision_event(neoastra_view_t* view, neoastra_decision_t* decision) noexcept { neo_finish_decision_event(view->environment->app, decision); }
 void neo_drain_dispatch(neoastra_app_t* app) noexcept;
+#if defined(__ANDROID__)
+// Answers neoastra_platform_call through the Java side of the Android backend.
+neoastra_result_t neo_android_platform_call(const std::string& service, const std::string& request, neoastra_buffer_t** response, neoastra_error_t** error) noexcept;
+#endif
 void neo_complete_ui_shutdown(neoastra_app_t* app) noexcept;
 void neo_complete_app_shutdown(neoastra_app_t* app) noexcept;
 void neo_destroy_app_on_ui(neoastra_app_t* app) noexcept;
