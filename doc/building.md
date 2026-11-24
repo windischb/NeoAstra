@@ -69,6 +69,21 @@ dotnet run --project src/NeoAstra.Conformance -c Release -- --run
 
 Add `--stress` for the bounded high-volume scenarios or `--timeout-seconds N` to change the per-scenario limit. The harness uses only copied `conformance://` fixtures and prints an explicit `SKIP` when a backend capability, trusted user activation, destructive process failure, filesystem mutation, or subprocess isolation prevents safe automation.
 
+Use `--run --request-filter-only` for the managed request-filter lifecycle checks
+alone, without the broader automation and media-capture scenarios. This focused
+mode cannot be combined with `--stress`. It includes disposable HTTPS loopback
+servers where the backend supports test-local TLS decisions; it does not access
+public servers or install certificates into system trust stores.
+
+The native [Apple request-filter probes](request-filter.md#reproduce-the-macos-probe)
+also have an iOS simulator runner, `eng/run_ios_request_filter_probe.py`. It
+creates and removes its own simulator rather than using an existing app/profile.
+The [Android integration runner](request-filter.md#reproduce-the-android-integration-probe),
+`eng/run_android_request_filter_probe.py`, builds the real Java/JNI backend from
+local SDK tools and cached dependencies, then tests it in disposable ARM64 AVDs.
+It does not use USB devices or existing emulator profiles. Pass `--https` to
+repeat the matrix with a disposable CA trusted only by the test APK.
+
 The `automation:` scenarios call the [browser automation](browser-automation.md) tools by name against a fixture whose content security policy allows no inline script. Unlike the other scenarios, each of them reports its own `FAIL` line and the following ones still run, so that one run shows everything that differs on a platform; the run fails at the end when any of them did. They keep their windows hidden, except for the last one, which shows its window to capture it, to click at coordinates, and to resize it.
 
 Two tests of `WindowsDropTargetTests` drag a page element with the real mouse of a Windows desktop, within a window and to another one, and are skipped unless `NEOASTRA_TEST_REAL_INPUT` is `1`. They take the pointer for about two seconds each, drive it from a thread of their own, release the button in every case, and let go when someone else moves the mouse. Keep their windows uncovered while they run:

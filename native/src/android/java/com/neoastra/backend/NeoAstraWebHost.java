@@ -64,7 +64,7 @@ import java.util.concurrent.Executors;
  *
  * <p>The native library drives one instance per view through JNI and receives what the view reports through the native
  * methods below, which it registers when Java loads it. Every member that JNI reaches is public so that R8 keeps its name.
- * All calls except {@link #nativeResource} run on the main thread, which owns the WebView.</p>
+ * Resource and filter checks may run on WebView request threads; other calls run on the main thread.</p>
  */
 public final class NeoAstraWebHost {
     static { System.loadLibrary("neoastra_native"); }
@@ -95,6 +95,8 @@ public final class NeoAstraWebHost {
     /** A message that a script of an isolated world posted through its binding, which the page does not reach. */
     public static native void nativeScriptMessage(long view, String world, String binding, String data, String origin, boolean isMainFrame);
     public static native Response nativeResource(long view, String url, String method, String headers, boolean isMainFrame);
+    /** Reads one immutable native filter snapshot on the request thread; true refuses the request. */
+    public static native boolean nativeRefusesRequest(long view, String url, boolean isMainFrame);
     public static native void nativeEvent(long view, int kind, String url, String text, int value);
     public static native void nativeEvaluated(long token, String json);
     public static native void nativeCaptured(long token, byte[] image, String failure);
@@ -124,6 +126,7 @@ public final class NeoAstraWebHost {
     private final String projectedSuffix;
     private final Map<Integer, ScriptHandler> scripts = new HashMap<>();
     private volatile long view;
+    private final NeoAstraRequestFilterGate requestFilter;
     private volatile JavaScriptReplyProxy reply;
     private int nextScript = 1;
     private volatile boolean engineDialogs = true;
@@ -163,12 +166,19 @@ public final class NeoAstraWebHost {
      * @param projectedSuffix the host suffix that marks a projected custom-scheme origin, such as ".invalid"
      */
     public static NeoAstraWebHost create(ViewGroup parent, long view, String[] listenerOrigins, String projectedSuffix) {
-        return new NeoAstraWebHost(parent, view, listenerOrigins, projectedSuffix);
+        // An older native library calls this signature and has no filter JNI method.
+        return new NeoAstraWebHost(parent, view, listenerOrigins, projectedSuffix, false);
     }
 
-    private NeoAstraWebHost(ViewGroup parent, long nativeView, String[] listenerOrigins, String suffix) {
+    /** Native libraries with request-filter support explicitly enable their new JNI method. */
+    public static NeoAstraWebHost create(ViewGroup parent, long view, String[] listenerOrigins, String projectedSuffix, boolean requestFilters) {
+        return new NeoAstraWebHost(parent, view, listenerOrigins, projectedSuffix, requestFilters);
+    }
+
+    private NeoAstraWebHost(ViewGroup parent, long nativeView, String[] listenerOrigins, String suffix, boolean requestFilters) {
         this.parent = parent;
         this.view = nativeView;
+        this.requestFilter = new NeoAstraRequestFilterGate(nativeView, requestFilters ? NeoAstraWebHost::nativeRefusesRequest : null);
         this.projectedSuffix = suffix;
         webView = new NeoAstraKeyboard.InsetsWebView(parent.getContext());
         webView.getSettings().setJavaScriptEnabled(true);
@@ -583,6 +593,9 @@ public final class NeoAstraWebHost {
     }
 
     public void destroy() {
+        // Finish a request-thread match before native storage can be reused.
+        // Native teardown drops its live-registry lock before calling this.
+        requestFilter.close();
         if (debugging) {
             // The view goes anyway, also when the switch fails.
             try { DEBUGGING.change(false); } catch (RuntimeException exception) { DEBUGGING.forget(); }
@@ -623,6 +636,8 @@ public final class NeoAstraWebHost {
 
         @Override public WebResourceResponse shouldInterceptRequest(WebView source, WebResourceRequest request) {
             Uri uri = request.getUrl();
+            if (requestFilter.refuses(uri.toString(), request.isForMainFrame()))
+                return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden", Collections.emptyMap(), new ByteArrayInputStream(new byte[0]));
             if (!projected(uri)) {
                 // Android does not ask shouldOverrideUrlLoading before a main-frame POST, the submission of a form, so the navigation
                 // policy never hears of it, and its body could not be sent again after a later decision. A form that posts to the

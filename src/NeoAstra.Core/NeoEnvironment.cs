@@ -80,6 +80,8 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
     /// <param name="cancellationToken">Cancels the managed wait and requests native cancellation.</param>
     /// <returns>The created browser view.</returns>
     /// <exception cref="PlatformNotSupportedException">Explicit bridge origins were supplied on Linux, which does not implement them.</exception>
+    /// <exception cref="ArgumentException">An initial request filter is invalid.</exception>
+    /// <exception cref="NotSupportedException">A nonempty initial request filter requires coverage the native library or backend does not provide.</exception>
     public ValueTask<NeoAstra> CreateWebViewAsync(NeoAstraHost host, NeoAstraOptions? options = null, CancellationToken cancellationToken = default)
         => NeoTransportViewInitializer.CreateAsync(this, host, options, 0, cancellationToken);
 
@@ -107,6 +109,11 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
             throw new PlatformNotSupportedException("Explicit bridge origins are not supported by this backend.");
         }
 
+        var requestedFilter = options.RequestFilter;
+        var filterSnapshot = NeoRequestFilter.CreateSnapshot(requestedFilter);
+        if (NeoAstra.CheckRequestFilterSupport(RuntimeInfo, filterSnapshot) is { } unsupported) throw unsupported;
+        using var filter = new NativeRequestFilter(filterSnapshot);
+        var nativeFilter = filter.Value;
         using var bridgeOrigins = new Utf8StringArray(options.BridgeOrigins);
         var parent = new NativeMethods.neoastra_native_parent
         {
@@ -129,8 +136,8 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
 
         var raw = new NativeMethods.neoastra_view_options
         {
-            size = (uint)sizeof(NativeMethods.neoastra_view_options),
-            version = 1,
+            size = NativeRequestFilter.ViewOptionsSize(RuntimeInfo.HasRequestFilters),
+            version = RuntimeInfo.HasRequestFilters ? 2u : 1u,
             profile = options.Profile is null ? default : options.Profile.NativeHandle,
             parent = parent,
             window = host.Window is null ? default : host.Window.NativeHandle,
@@ -148,9 +155,10 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
             bridge_origin_count = bridgeOrigins.Count,
             bridge_policy = (NativeMethods.neoastra_bridge_policy)options.BridgePolicy,
             bridge_origins = bridgeOrigins.Views,
+            request_filter = RuntimeInfo.HasRequestFilters && requestedFilter is not null ? &nativeFilter : null,
         };
         var nativeOptions = new NativeMethods.neoastra_view_options_t(raw);
-        var operation = new NativeOperation<NeoAstra>(cancellationToken, new ViewCreation(this, host, options));
+        var operation = new NativeOperation<NeoAstra>(cancellationToken, new ViewCreation(this, host, options, filterSnapshot));
         NativeMethods.neoastra_operation_t nativeOperation = default;
         NativeMethods.neoastra_error_t error = default;
         NativeMethods.neoastra_result_t result;
@@ -212,6 +220,8 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
     // A capability that the loaded native library predates is not supported, rather than an argument it refuses.
     internal static NeoCapabilityInfo? CapabilityUnknownToLibrary(NeoRuntimeInfo runtime, NeoCapability capability) => capability switch
     {
+        NeoCapability.RequestFilter when !runtime.HasRequestFilters =>
+            new NeoCapabilityInfo(NeoSupportLevel.None, 1, 0, "The loaded native library has no request-filter ABI."),
         NeoCapability.ScriptWorldChannel when !runtime.HasScriptWorldChannels =>
             new NeoCapabilityInfo(NeoSupportLevel.None, 1, 0, "The loaded native library has no script bindings of isolated worlds."),
         NeoCapability.ViewPlacement when !runtime.HasViewPlacement =>
@@ -317,7 +327,8 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
             if (NativeError.Code(result) == NeoErrorCode.Success && view.Handle != 0)
             {
                 var creation = (ViewCreation)operation.Owner!;
-                operation.Complete(new NeoAstra(creation.Environment, new SafeViewHandle(view.Handle), creation.Host, creation.Options));
+                var created = new NeoAstra(creation.Environment, new SafeViewHandle(view.Handle), creation.Host, creation.Options, creation.Filter);
+                if (!operation.TryComplete(created)) _ = created.DisposeAsync();
             }
             else
             {
@@ -332,7 +343,7 @@ public sealed unsafe class NeoEnvironment : IAsyncDisposable
     }
 
     private sealed record ProfileCreation(NeoEnvironment Environment, bool IsEphemeral);
-    private sealed record ViewCreation(NeoEnvironment Environment, NeoAstraHost Host, NeoAstraOptions Options);
+    private sealed record ViewCreation(NeoEnvironment Environment, NeoAstraHost Host, NeoAstraOptions Options, NeoRequestFilter Filter);
 }
 
 internal static class NeoTransportViewInitializer

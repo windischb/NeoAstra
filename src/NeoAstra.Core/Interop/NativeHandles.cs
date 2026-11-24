@@ -69,10 +69,16 @@ internal sealed class SafeOperationHandle(nint value) : NeoSafeHandle(value)
 {
     internal void Cancel()
     {
-        if (!IsInvalid && !IsClosed)
+        var retained = false;
+        try
         {
-            NativeMethods.neoastra_operation_cancel(new(handle));
+            // Completion can dispose this SafeHandle on another thread while
+            // a token callback requests cancellation.
+            DangerousAddRef(ref retained);
+            if (!IsInvalid) NativeMethods.neoastra_operation_cancel(new(handle));
         }
+        catch (ObjectDisposedException) { /* Native completion already won. */ }
+        finally { if (retained) DangerousRelease(); }
     }
 
     protected override bool ReleaseHandle()

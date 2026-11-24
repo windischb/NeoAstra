@@ -248,7 +248,7 @@ void test_capabilities_follow_the_backend_and_fail_closed() {
     neoastra_capability_info_t info{};
     info.size = sizeof(info);
     info.version = 1;
-    assert(neoastra_environment_get_capability(environment, static_cast<neoastra_capability_t>(NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL + 1), &info) == NEOASTRA_ERROR_INVALID_ARGUMENT);
+    assert(neoastra_environment_get_capability(environment, static_cast<neoastra_capability_t>(NEOASTRA_CAPABILITY_REQUEST_FILTER + 1), &info) == NEOASTRA_ERROR_INVALID_ARGUMENT);
     backend::script_worlds_supported = false;
 
     neoastra_runtime_info_t runtime{};

@@ -20,6 +20,7 @@ assuming that every browser engine supports every portable event.
 | Trusted message origins | Exact trusted-origin policy available | Exact trusted-origin policy available | Unavailable; sender-origin data is not trustworthy |
 | Views placed in a window (`BoundedInWindow`, `SetBounds`, `IsVisible`, `Focus`, `PlaceOver`, `KeyChordPressed`) | Available; bounds in physical pixels | Available; bounds in points | Available; bounds in GTK logical pixels. Verified on X11 and on GNOME Wayland |
 | Scripts of isolated worlds and their bindings (`NeoCapability.ScriptWorldChannel`) | Available, through the DevTools protocol of the view | Available from macOS 11 | Available |
+| Declarative request filter (`NeoCapability.RequestFilter`) | Not implemented | Limited base coverage in the rebuilt ARM64 runtime; [coverage and update semantics](request-filter.md) | Not implemented |
 | Arbitrary-method top-level navigation | Available | Available | Not exposed; only a plain `GET` without extra headers/body uses portable navigation |
 | Back/forward availability (`CanGoBack`, `CanGoForward`) | Available | Available | Available |
 | Kind of a navigation request (`NeoNavigationRequest.Kind`) | Reported from the WebView2 Runtime 115 on | Reported; unknown for a reload or a history navigation after a form submission | Reported; unknown for a reload or a history navigation after a form submission |
@@ -50,6 +51,11 @@ assuming that every browser engine supports every portable event.
 | Mutable per-window task-switcher membership | Available | Not exposed; Dock membership is application-scoped | Available as a window-manager hint |
 | Separate browser data for each `UserDataRoot` | Available; the root is the WebView2 user-data folder | Available from macOS 14; WebKit keeps the data in its own container | Available; the root holds the WebKitGTK data and cache directories |
 | Private environment (`IsPrivate`) | Available; every view is InPrivate, and the in-memory data is shared across the user-data folder | Available; one in-memory store for each environment | Available; one in-memory session for each environment |
+
+Mobile request filters also report only `Limited` base coverage. Android
+subresource redirect destinations bypass the request hook in the tested engines;
+redirect, worker and WebSocket coverage is not advertised. See the
+[per-backend evidence and limits](request-filter.md#native-contract-and-current-coverage).
 
 WebKit callback contracts require a popup request on macOS and Linux to be decided synchronously. A
 handler for one that does not complete inline receives the documented safe default instead of an

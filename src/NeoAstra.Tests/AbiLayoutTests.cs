@@ -29,9 +29,17 @@ public sealed class AbiLayoutTests
         AssertLayout<NativeMethods.neoastra_environment_options>(96, (nameof(NativeMethods.neoastra_environment_options.custom_scheme_stride), 88));
         AssertLayout<NativeMethods.neoastra_profile_options>(32, (nameof(NativeMethods.neoastra_profile_options.ephemeral), 24));
         AssertLayout<NativeMethods.neoastra_window_options>(80, (nameof(NativeMethods.neoastra_window_options.background_color), 72));
-        AssertLayout<NativeMethods.neoastra_view_options>(104,
+        AssertLayout<NativeMethods.neoastra_view_options>(112,
             (nameof(NativeMethods.neoastra_view_options.bridge_policy), 92),
-            (nameof(NativeMethods.neoastra_view_options.bridge_origins), 96));
+            (nameof(NativeMethods.neoastra_view_options.bridge_origins), 96),
+            (nameof(NativeMethods.neoastra_view_options.request_filter), 104));
+        AssertLayout<NativeMethods.neoastra_request_rule>(48,
+            (nameof(NativeMethods.neoastra_request_rule.host), 16),
+            (nameof(NativeMethods.neoastra_request_rule.port), 32));
+        AssertLayout<NativeMethods.neoastra_request_filter>(32,
+            (nameof(NativeMethods.neoastra_request_filter.rules), 8),
+            (nameof(NativeMethods.neoastra_request_filter.rule_count), 16),
+            (nameof(NativeMethods.neoastra_request_filter.required_flags), 24));
         // Version 1 of the script options ends at 40, where version 2 appends the binding.
         AssertLayout<NativeMethods.neoastra_script_options>(56,
             (nameof(NativeMethods.neoastra_script_options.world_name), 24),
@@ -82,7 +90,12 @@ public sealed class AbiLayoutTests
         AssertEnum<uint, NativeMethods.neoastra_permission_kind>(0, 12);
         AssertEnum<uint, NativeMethods.neoastra_process_failure_kind>(0, 3);
         AssertEnum<uint, NativeMethods.neoastra_event_type>(0, 41);
-        AssertEnum<uint, NativeMethods.neoastra_capability>(0, 34);
+        AssertEnum<uint, NativeMethods.neoastra_capability>(0, 35);
+        AssertEnum<uint, NativeMethods.neoastra_request_host_match>(0, 3);
+        Assert.AreEqual(typeof(uint), Enum.GetUnderlyingType(typeof(NativeMethods.neoastra_request_schemes)));
+        CollectionAssert.AreEqual(new long[] { 0, 1, 2, 4, 8 }, Values<NativeMethods.neoastra_request_schemes>());
+        Assert.AreEqual(typeof(ulong), Enum.GetUnderlyingType(typeof(NativeMethods.neoastra_request_filter_flags)));
+        CollectionAssert.AreEqual(new long[] { 0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 }, Values<NativeMethods.neoastra_request_filter_flags>());
         AssertEnum<uint, NativeMethods.neoastra_log_level>(0, 5);
         AssertEnum<uint, NativeMethods.neoastra_resource_kind>(0, 12);
         AssertEnum<uint, NativeMethods.neoastra_resource_body_kind>(0, 2);
@@ -113,6 +126,9 @@ public sealed class AbiLayoutTests
         AssertEquivalent<NeoPermissionKind, NativeMethods.neoastra_permission_kind>();
         AssertEquivalent<NeoProcessFailureKind, NativeMethods.neoastra_process_failure_kind>();
         AssertEquivalent<NeoCapability, NativeMethods.neoastra_capability>();
+        AssertEquivalent<NeoHostMatch, NativeMethods.neoastra_request_host_match>();
+        AssertEquivalent<NeoRequestSchemes, NativeMethods.neoastra_request_schemes>();
+        AssertEquivalent<NeoRequestFilterFlags, NativeMethods.neoastra_request_filter_flags>();
         AssertEquivalent<NeoLogLevel, NativeMethods.neoastra_log_level>();
         AssertEquivalent<NeoResourceKind, NativeMethods.neoastra_resource_kind>();
         AssertEquivalent<NeoCaptureFormat, NativeMethods.neoastra_capture_format>();

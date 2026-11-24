@@ -17,6 +17,8 @@
 @import UIKit;
 @import WebKit;
 
+#include "../common/apple_request_filter.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -71,6 +73,8 @@ struct uikit_view {
     std::unordered_map<std::string, WKUserScript*> scripts;
     // The bindings of the scripts that have one, by the identifier of the script.
     std::unordered_map<std::string, NeoAstraScriptChannel*> channels;
+    std::shared_ptr<neo_apple_filter::store> filter_store;
+    std::shared_ptr<neo_apple_filter::entry> filter_entry;
     uint64_t history{};
     ~uikit_view() {
         if (delegate) delegate.nativeView = nullptr;
@@ -193,6 +197,12 @@ void new_window_decided(void* pointer, const neoastra_decision_response_t* respo
     @autoreleasepool {
         std::unique_ptr<new_window_context> context(static_cast<new_window_context*>(pointer));
         if (response->action != NEOASTRA_DECISION_ALLOW || response->target_view) return;
+        // A deferred host decision may outlive a filter update. Check the
+        // current local snapshot before turning this popup into a navigation.
+        try {
+            const auto rules = std::atomic_load(&context->view->request_filter);
+            if (rules && rules->refuses(context->uri, NEOASTRA_RESOURCE_DOCUMENT)) return;
+        } catch (...) { return; } // An uncheckable target must not become a fallback.
         auto* state = static_cast<uikit_view*>(context->view->platform);
         NSURL* url = [NSURL URLWithString:ns_string(context->uri)];
         if (state && state->webview && url) [state->webview loadRequest:[NSURLRequest requestWithURL:url]];
@@ -965,6 +975,17 @@ neoastra_result_t neo_platform_profile_get_cookies(neoastra_profile_t*, const st
 neoastra_result_t neo_platform_profile_set_cookie(neoastra_profile_t*, const neoastra_cookie_t*, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t** error) noexcept { return unsupported(error, "Cookie access"); }
 neoastra_result_t neo_platform_profile_delete_cookie(neoastra_profile_t*, const neoastra_cookie_t*, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t** error) noexcept { return unsupported(error, "Cookie access"); }
 neoastra_result_t neo_platform_profile_clear_data(neoastra_profile_t*, neoastra_data_kind_t, int64_t, int64_t, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t** error) noexcept { return unsupported(error, "Clearing browser data"); }
+
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t*) noexcept {
+    // UIKit has its own engine probe; do not infer extra coverage from the
+    // broad WebKit rule format or from the macOS implementation.
+    return NEOASTRA_REQUEST_FILTER_SUBRESOURCES | NEOASTRA_REQUEST_FILTER_FRAMES | NEOASTRA_REQUEST_FILTER_PER_VIEW;
+}
+
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t* view, const neo_request_filter::filter& rules,
+    neo_request_filter_prepared_callback_t callback, void* context, neoastra_error_t** error) noexcept {
+    return neo_apple_filter::prepare<uikit_view>(view, rules, callback, context, error);
+}
 
 bool neo_platform_view_create_async(neoastra_view_t* view, const neoastra_view_options_t* options, neo_platform_created_callback_t callback, void* context, neoastra_error_t** error) noexcept {
     @autoreleasepool {

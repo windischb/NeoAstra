@@ -537,6 +537,11 @@ namespace NeoAstra.Interop.Generated
             /// script with NEOASTRA_ERROR_NOT_SUPPORTED: it never gives the binding to the page instead.
             /// </summary>
             NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL = unchecked((uint)34),
+
+            /// <summary>
+            /// Declarative request refusal; flags describe the backend's observed coverage, not a network sandbox.
+            /// </summary>
+            NEOASTRA_CAPABILITY_REQUEST_FILTER = unchecked((uint)35),
         }
 
         /// <summary>
@@ -597,6 +602,65 @@ namespace NeoAstra.Interop.Generated
             NEOASTRA_RESOURCE_WEBSOCKET = unchecked((uint)11),
 
             NEOASTRA_RESOURCE_MANIFEST = unchecked((uint)12),
+        }
+
+        /// <summary>
+        /// The target host criterion of a request-refusal rule. Suffix includes the named DNS host and its subdomains.
+        /// </summary>
+        public enum neoastra_request_host_match : uint
+        {
+            NEOASTRA_REQUEST_HOST_ANY = unchecked((uint)0),
+
+            NEOASTRA_REQUEST_HOST_EXACT = unchecked((uint)1),
+
+            NEOASTRA_REQUEST_HOST_SUFFIX = unchecked((uint)2),
+
+            NEOASTRA_REQUEST_HOST_LOOPBACK = unchecked((uint)3),
+        }
+
+        /// <summary>
+        /// Scheme mask for request rules. HTTP/WS use effective port 80, HTTPS/WSS port 443.
+        /// </summary>
+        public enum neoastra_request_schemes : uint
+        {
+            NEOASTRA_REQUEST_SCHEMES_NONE = unchecked((uint)0),
+
+            NEOASTRA_REQUEST_HTTP = unchecked((uint)1),
+
+            NEOASTRA_REQUEST_HTTPS = unchecked((uint)2),
+
+            NEOASTRA_REQUEST_WS = unchecked((uint)4),
+
+            NEOASTRA_REQUEST_WSS = unchecked((uint)8),
+        }
+
+        /// <summary>
+        /// Coverage bits in NEOASTRA_CAPABILITY_REQUEST_FILTER. Missing classes are not guaranteed.
+        /// SUBRESOURCES, FRAMES and PER_VIEW are the minimum for a nonempty filter.
+        /// </summary>
+        public enum neoastra_request_filter_flags : ulong
+        {
+            NEOASTRA_REQUEST_FILTER_NONE = unchecked((ulong)0),
+
+            NEOASTRA_REQUEST_FILTER_SUBRESOURCES = unchecked((ulong)1),
+
+            NEOASTRA_REQUEST_FILTER_FRAMES = unchecked((ulong)2),
+
+            NEOASTRA_REQUEST_FILTER_WEBSOCKETS = unchecked((ulong)4),
+
+            NEOASTRA_REQUEST_FILTER_REDIRECTS = unchecked((ulong)8),
+
+            NEOASTRA_REQUEST_FILTER_SERVICE_WORKERS = unchecked((ulong)16),
+
+            NEOASTRA_REQUEST_FILTER_SHARED_WORKERS = unchecked((ulong)32),
+
+            NEOASTRA_REQUEST_FILTER_PER_VIEW = unchecked((ulong)64),
+
+            NEOASTRA_REQUEST_FILTER_REPORTS_REFUSALS = unchecked((ulong)128),
+
+            NEOASTRA_REQUEST_FILTER_RESOURCE_KINDS = unchecked((ulong)256),
+
+            NEOASTRA_REQUEST_FILTER_DEDICATED_WORKERS = unchecked((ulong)512),
         }
 
         public enum neoastra_resource_body_kind : uint
@@ -1189,6 +1253,78 @@ namespace NeoAstra.Interop.Generated
             public static implicit operator neoastra_title_bar_style_t (NativeMethods.neoastra_title_bar_style from) => new (from);
         }
 
+        /// <summary>
+        /// One refusal rule, version 1 and size exactly sizeof(neoastra_request_rule_t).
+        /// Criteria are ANDed; rules are ORed. Host is required for Exact/Suffix and absent for Any/Loopback.
+        /// It is canonical lowercase ASCII (IDNA done by the caller), at most 253 bytes, without IPv6 brackets.
+        /// Suffix accepts DNS names only. Port is -1 for any, otherwise 1..65535.
+        /// Schemes and kinds are nonempty masks; narrower kinds require RESOURCE_KINDS support.
+        /// </summary>
+        public partial struct neoastra_request_rule
+        {
+            public uint size;
+
+            public uint version;
+
+            public NativeMethods.neoastra_request_host_match_t host_match;
+
+            public NativeMethods.neoastra_string_view_t host;
+
+            public int port;
+
+            public uint schemes;
+
+            public uint kinds;
+        }
+
+        /// <summary>
+        /// The target host criterion of a request-refusal rule. Suffix includes the named DNS host and its subdomains.
+        /// </summary>
+        public readonly partial record struct neoastra_request_host_match_t(NativeMethods.neoastra_request_host_match Value)
+        {
+            public static implicit operator NativeMethods.neoastra_request_host_match (neoastra_request_host_match_t from) => from.Value;
+
+            public static implicit operator neoastra_request_host_match_t (NativeMethods.neoastra_request_host_match from) => new (from);
+        }
+
+        /// <summary>
+        /// Version 1 filter description. At most 256 contiguous rules; count 0 and a null rules pointer removes the filter.
+        /// Required flags add to the mandatory SUBRESOURCES | FRAMES | PER_VIEW baseline.
+        /// Input arrays and strings are copied before an accepting entry point returns.
+        /// </summary>
+        public partial struct neoastra_request_filter
+        {
+            public uint size;
+
+            public uint version;
+
+            public NativeMethods.neoastra_request_rule_t* rules;
+
+            public uint rule_count;
+
+            public ulong required_flags;
+        }
+
+        /// <summary>
+        /// One refusal rule, version 1 and size exactly sizeof(neoastra_request_rule_t).
+        /// Criteria are ANDed; rules are ORed. Host is required for Exact/Suffix and absent for Any/Loopback.
+        /// It is canonical lowercase ASCII (IDNA done by the caller), at most 253 bytes, without IPv6 brackets.
+        /// Suffix accepts DNS names only. Port is -1 for any, otherwise 1..65535.
+        /// Schemes and kinds are nonempty masks; narrower kinds require RESOURCE_KINDS support.
+        /// </summary>
+        public readonly partial record struct neoastra_request_rule_t(NativeMethods.neoastra_request_rule Value)
+        {
+            public static implicit operator NativeMethods.neoastra_request_rule (neoastra_request_rule_t from) => from.Value;
+
+            public static implicit operator neoastra_request_rule_t (NativeMethods.neoastra_request_rule from) => new (from);
+        }
+
+        /// <summary>
+        /// Version 1 ends before request_filter; it remains accepted with its original size.
+        /// Version 2 adds an initial filter, installed before view publication/first explicit navigation.
+        /// Null means empty for a regular view, or inheritance from the opener for a tracked popup.
+        /// A non-null empty description explicitly requests no filter. Unsupported/invalid nonempty filters fail creation.
+        /// </summary>
         public partial struct neoastra_view_options
         {
             public uint size;
@@ -1216,6 +1352,8 @@ namespace NeoAstra.Interop.Generated
             public NativeMethods.neoastra_bridge_policy_t bridge_policy;
 
             public NativeMethods.neoastra_string_view_t* bridge_origins;
+
+            public NativeMethods.neoastra_request_filter_t* request_filter;
         }
 
         public readonly partial record struct neoastra_native_parent_t(NativeMethods.neoastra_native_parent Value)
@@ -1230,6 +1368,18 @@ namespace NeoAstra.Interop.Generated
             public static implicit operator NativeMethods.neoastra_bridge_policy (neoastra_bridge_policy_t from) => from.Value;
 
             public static implicit operator neoastra_bridge_policy_t (NativeMethods.neoastra_bridge_policy from) => new (from);
+        }
+
+        /// <summary>
+        /// Version 1 filter description. At most 256 contiguous rules; count 0 and a null rules pointer removes the filter.
+        /// Required flags add to the mandatory SUBRESOURCES | FRAMES | PER_VIEW baseline.
+        /// Input arrays and strings are copied before an accepting entry point returns.
+        /// </summary>
+        public readonly partial record struct neoastra_request_filter_t(NativeMethods.neoastra_request_filter Value)
+        {
+            public static implicit operator NativeMethods.neoastra_request_filter (neoastra_request_filter_t from) => from.Value;
+
+            public static implicit operator neoastra_request_filter_t (NativeMethods.neoastra_request_filter from) => new (from);
         }
 
         /// <summary>
@@ -1567,6 +1717,27 @@ namespace NeoAstra.Interop.Generated
             public static implicit operator neoastra_window_capability_t (NativeMethods.neoastra_window_capability from) => new (from);
         }
 
+        /// <summary>
+        /// Scheme mask for request rules. HTTP/WS use effective port 80, HTTPS/WSS port 443.
+        /// </summary>
+        public readonly partial record struct neoastra_request_schemes_t(NativeMethods.neoastra_request_schemes Value)
+        {
+            public static implicit operator NativeMethods.neoastra_request_schemes (neoastra_request_schemes_t from) => from.Value;
+
+            public static implicit operator neoastra_request_schemes_t (NativeMethods.neoastra_request_schemes from) => new (from);
+        }
+
+        /// <summary>
+        /// Coverage bits in NEOASTRA_CAPABILITY_REQUEST_FILTER. Missing classes are not guaranteed.
+        /// SUBRESOURCES, FRAMES and PER_VIEW are the minimum for a nonempty filter.
+        /// </summary>
+        public readonly partial record struct neoastra_request_filter_flags_t(NativeMethods.neoastra_request_filter_flags Value)
+        {
+            public static implicit operator NativeMethods.neoastra_request_filter_flags (neoastra_request_filter_flags_t from) => from.Value;
+
+            public static implicit operator neoastra_request_filter_flags_t (NativeMethods.neoastra_request_filter_flags from) => new (from);
+        }
+
         public readonly partial record struct neoastra_data_kind_t(ulong Value)
         {
             public static implicit operator ulong (neoastra_data_kind_t from) => from.Value;
@@ -1705,6 +1876,12 @@ namespace NeoAstra.Interop.Generated
             public static implicit operator neoastra_title_bar_t (NativeMethods.neoastra_title_bar from) => new (from);
         }
 
+        /// <summary>
+        /// Version 1 ends before request_filter; it remains accepted with its original size.
+        /// Version 2 adds an initial filter, installed before view publication/first explicit navigation.
+        /// Null means empty for a regular view, or inheritance from the opener for a tracked popup.
+        /// A non-null empty description explicitly requests no filter. Unsupported/invalid nonempty filters fail creation.
+        /// </summary>
         public readonly partial record struct neoastra_view_options_t(NativeMethods.neoastra_view_options Value)
         {
             public static implicit operator NativeMethods.neoastra_view_options (neoastra_view_options_t from) => from.Value;
@@ -2436,6 +2613,19 @@ namespace NeoAstra.Interop.Generated
         [global::System.Runtime.InteropServices.LibraryImport(NativeMethods.LibraryName, EntryPoint = "neoastra_view_evaluate_script_async")]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
         public static partial NativeMethods.neoastra_result_t neoastra_view_evaluate_script_async(NativeMethods.neoastra_view_t arg0, NativeMethods.neoastra_string_view_t arg1, NativeMethods.neoastra_string_callback_t arg2, void* arg3, NativeMethods.neoastra_operation_t* arg4, NativeMethods.neoastra_error_t* arg5);
+
+        /// <summary>
+        /// Replaces a view's declarative request filter on the UI thread; calls are installed in order.
+        /// Success completes after local installation, not acknowledgement by every engine process.
+        /// No zero-TCP, immediate global cut-over or cancellation of in-flight network requests is promised.
+        /// Cancellation before local installation prevents it; after installation its result wins.
+        /// A successful start delivers one callback through the UI dispatcher, including on disposal/shutdown;
+        /// a start error delivers none. Invalid descriptions return INVALID_ARGUMENT; missing coverage returns NOT_SUPPORTED.
+        /// Preparation failures keep the previous filter. An installation failure may tear down the view rather than leave it unprotected.
+        /// </summary>
+        [global::System.Runtime.InteropServices.LibraryImport(NativeMethods.LibraryName, EntryPoint = "neoastra_view_set_request_filter_async")]
+        [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
+        public static partial NativeMethods.neoastra_result_t neoastra_view_set_request_filter_async(NativeMethods.neoastra_view_t arg0, NativeMethods.neoastra_request_filter_t* arg1, NativeMethods.neoastra_completion_callback_t arg2, void* arg3, NativeMethods.neoastra_operation_t* arg4, NativeMethods.neoastra_error_t* arg5);
 
         [global::System.Runtime.InteropServices.LibraryImport(NativeMethods.LibraryName, EntryPoint = "neoastra_view_add_script_async")]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]

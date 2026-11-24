@@ -436,6 +436,8 @@ public sealed class NeoNewWindowRequest
     /// <returns>The tracked popup view.</returns>
     /// <exception cref="InvalidOperationException">Creation was already started, or the popup decision is no longer active.</exception>
     /// <exception cref="ArgumentException"><paramref name="options"/> specifies a profile other than the opener profile.</exception>
+    /// <exception cref="NotSupportedException">The initial filter is unsupported, or cannot be prepared within the backend's synchronous popup callback.</exception>
+    /// <exception cref="ObjectDisposedException">The opener has been disposed.</exception>
     public ValueTask<NeoAstra> CreateViewAsync(NeoAstraHost host, NeoAstraOptions? options = null, CancellationToken cancellationToken = default)
     {
         if (Interlocked.Exchange(ref _creationStarted, 1) != 0)
@@ -445,6 +447,7 @@ public sealed class NeoNewWindowRequest
 
         options ??= new NeoAstraOptions();
         options.Profile ??= _opener.Profile;
+        options.RequestFilter ??= _opener.RequestFilter;
         if (!ReferenceEquals(options.Profile, _opener.Profile))
         {
             throw new ArgumentException("A popup view must use the opener's profile.", nameof(options));

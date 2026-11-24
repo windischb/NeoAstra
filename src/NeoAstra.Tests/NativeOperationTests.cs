@@ -47,4 +47,35 @@ public sealed class NativeOperationTests
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => failed.ValueTask.AsTask());
         Assert.AreEqual("Start rejected.", exception.Message);
     }
+
+    [TestMethod]
+    public async Task ConfirmedCancellationWaitsForTheNativeOutcome()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var operation = new NativeOperation<int>(cancellation.Token, owner: null, waitForNativeCancellation: true);
+        cancellation.Cancel();
+        Assert.IsFalse(operation.ValueTask.IsCompleted);
+        Assert.AreNotEqual(nint.Zero, operation.Context);
+        // The native local installation point won before cancellation arrived.
+        operation.Complete(42);
+        Assert.AreEqual(42, await operation.ValueTask);
+        Assert.AreEqual(nint.Zero, operation.Context);
+
+        var canceled = new NativeOperation<int>(cancellation.Token, owner: null, waitForNativeCancellation: true);
+        Assert.IsFalse(canceled.ValueTask.IsCompleted);
+        canceled.CancelFromNative();
+        await Assert.ThrowsAsync<TaskCanceledException>(() => canceled.ValueTask.AsTask());
+        Assert.AreEqual(nint.Zero, canceled.Context);
+    }
+
+    [TestMethod]
+    public async Task ACanceledWaitDoesNotTakeOwnershipOfALateValue()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var operation = new NativeOperation<int>(cancellation.Token);
+        cancellation.Cancel();
+        Assert.IsFalse(operation.TryComplete(42));
+        Assert.AreEqual(nint.Zero, operation.Context);
+        await Assert.ThrowsAsync<TaskCanceledException>(() => operation.ValueTask.AsTask());
+    }
 }

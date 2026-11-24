@@ -1,0 +1,14 @@
+{
+  "candidate-r2.patch.gz": {
+    "bytes": 21844,
+    "sha256": "c42db24e3edc432217a00df92e59ab940280520f578dbe738f74f735ca62e685"
+  },
+  "evidence-r2.zip": {
+    "bytes": 40255,
+    "sha256": "40048417ba9e746acc441f8a79f3877db123dd4068db1994fadb00f3c3610a82"
+  },
+  "review.md": {
+    "bytes": 4049,
+    "sha256": "9e676975792edeb01fc15d76d34fb6f6d7321e2e50f1e1c51a7e2d4f749193f1"
+  }
+}

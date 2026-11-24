@@ -23,7 +23,7 @@ internal static partial class Program
         if (!HarnessOptions.TryParse(args, out var options))
         {
             Console.Error.WriteLine(
-                "Usage: dotnet run --project src/NeoAstra.Conformance -c Release -- --run [--stress] [--timeout-seconds <5-300>]");
+                "Usage: dotnet run --project src/NeoAstra.Conformance -c Release -- --run [--stress | --request-filter-only] [--timeout-seconds <5-300>]");
             return 2;
         }
 
@@ -68,7 +68,13 @@ internal static partial class Program
             var environmentOptions = CreateEnvironmentOptions(frames);
             await using var environment = await application.CreateEnvironmentAsync(environmentOptions).AsTask().WaitAsync(options.Timeout);
             PrintRuntime(environment.RuntimeInfo);
-            Console.WriteLine($"MODE stress={options.Stress.ToString().ToLowerInvariant()} timeout={options.Timeout.TotalSeconds:F0}s network=disabled interactive=disabled");
+            Console.WriteLine($"MODE stress={options.Stress.ToString().ToLowerInvariant()} timeout={options.Timeout.TotalSeconds:F0}s network={(options.RequestFilterOnly ? "loopback-only" : "disabled")} interactive=disabled");
+            if (options.RequestFilterOnly)
+            {
+                await RunRequestFilterScenariosAsync(environment);
+                Console.WriteLine($"PASS request-filter conformance: {_passed} passed, {_skipped} skipped");
+                return;
+            }
 
             RequireCapability(environment, NeoCapability.CustomScheme, "The fixture requires custom-scheme navigation.");
             var supportsDocumentStart = IsSupported(environment, NeoCapability.ScriptDocumentStart);
@@ -423,6 +429,7 @@ internal static partial class Program
                 if (firstProfile is not null) await firstProfile.DisposeAsync();
             }
 
+            await RunRequestFilterScenariosAsync(environment);
             await RunFrameScenariosAsync(environment, frames, bridgeMode);
             await RunAutomationScenariosAsync(environment);
             await RunHistoryScenariosAsync(environment);
@@ -1126,13 +1133,14 @@ internal static partial class Program
         TrustEntireView,
     }
 
-    private sealed record HarnessOptions(bool Stress, TimeSpan Timeout)
+    private sealed record HarnessOptions(bool Stress, TimeSpan Timeout, bool RequestFilterOnly)
     {
         internal static bool TryParse(string[] args, out HarnessOptions options)
         {
             var stress = false;
             var timeoutSeconds = 20;
             var sawRun = false;
+            var requestFilterOnly = false;
             for (var index = 0; index < args.Length; index++)
             {
                 switch (args[index])
@@ -1142,6 +1150,9 @@ internal static partial class Program
                         break;
                     case "--stress" when !stress:
                         stress = true;
+                        break;
+                    case "--request-filter-only" when !requestFilterOnly:
+                        requestFilterOnly = true;
                         break;
                     case "--timeout-seconds" when index + 1 < args.Length &&
                                                    int.TryParse(args[++index], out var parsed) &&
@@ -1154,8 +1165,8 @@ internal static partial class Program
                 }
             }
 
-            options = new HarnessOptions(stress, TimeSpan.FromSeconds(stress && timeoutSeconds == 20 ? 120 : timeoutSeconds));
-            return sawRun;
+            options = new HarnessOptions(stress, TimeSpan.FromSeconds(stress && timeoutSeconds == 20 ? 120 : timeoutSeconds), requestFilterOnly);
+            return sawRun && !(stress && requestFilterOnly);
         }
     }
 }

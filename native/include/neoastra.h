@@ -118,11 +118,36 @@ typedef enum neoastra_capability : uint32_t { NEOASTRA_CAPABILITY_CUSTOM_SCHEME 
     /* A script of an isolated world with a binding that only that world reaches (neoastra_script_options_t binding_name),
        NEOASTRA_EVENT_SCRIPT_MESSAGE_RECEIVED, and neoastra_view_post_script_message. A backend without it refuses such a
        script with NEOASTRA_ERROR_NOT_SUPPORTED: it never gives the binding to the page instead. */
-    NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL } neoastra_capability_t;
+    NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL,
+    /** Declarative request refusal; flags describe the backend's observed coverage, not a network sandbox. */
+    NEOASTRA_CAPABILITY_REQUEST_FILTER } neoastra_capability_t;
 /** What a backend can do with displays and the placement of windows, which neoastra_app_get_window_capability tells. DISPLAYS: the displays and the display of a window; PLACEMENT: a position given to a window is where it goes; VIRTUAL_DESKTOPS: whether a window is on the current virtual desktop, and its identifier; VIRTUAL_DESKTOP_MOVE: neoastra_window_move_to_virtual_desktop; ALL_VIRTUAL_DESKTOPS: NEOASTRA_WINDOW_ALL_VIRTUAL_DESKTOPS. */
 typedef enum neoastra_window_capability : uint32_t { NEOASTRA_WINDOW_CAPABILITY_DISPLAYS = 0, NEOASTRA_WINDOW_CAPABILITY_PLACEMENT = 1, NEOASTRA_WINDOW_CAPABILITY_VIRTUAL_DESKTOPS = 2, NEOASTRA_WINDOW_CAPABILITY_VIRTUAL_DESKTOP_MOVE = 3, NEOASTRA_WINDOW_CAPABILITY_ALL_VIRTUAL_DESKTOPS = 4 } neoastra_window_capability_t;
 typedef enum neoastra_log_level : uint32_t { NEOASTRA_LOG_TRACE = 0, NEOASTRA_LOG_DEBUG, NEOASTRA_LOG_INFORMATION, NEOASTRA_LOG_WARNING, NEOASTRA_LOG_ERROR, NEOASTRA_LOG_CRITICAL } neoastra_log_level_t;
 typedef enum neoastra_resource_kind : uint32_t { NEOASTRA_RESOURCE_OTHER = 0, NEOASTRA_RESOURCE_DOCUMENT, NEOASTRA_RESOURCE_STYLESHEET, NEOASTRA_RESOURCE_IMAGE, NEOASTRA_RESOURCE_MEDIA, NEOASTRA_RESOURCE_FONT, NEOASTRA_RESOURCE_SCRIPT, NEOASTRA_RESOURCE_XML_HTTP_REQUEST, NEOASTRA_RESOURCE_FETCH, NEOASTRA_RESOURCE_TEXT_TRACK, NEOASTRA_RESOURCE_EVENT_SOURCE, NEOASTRA_RESOURCE_WEBSOCKET, NEOASTRA_RESOURCE_MANIFEST } neoastra_resource_kind_t;
+/** The target host criterion of a request-refusal rule. Suffix includes the named DNS host and its subdomains. */
+typedef enum neoastra_request_host_match : uint32_t {
+    NEOASTRA_REQUEST_HOST_ANY = 0, NEOASTRA_REQUEST_HOST_EXACT = 1,
+    NEOASTRA_REQUEST_HOST_SUFFIX = 2, NEOASTRA_REQUEST_HOST_LOOPBACK = 3
+} neoastra_request_host_match_t;
+/** Scheme mask for request rules. HTTP/WS use effective port 80, HTTPS/WSS port 443. */
+typedef enum neoastra_request_schemes : uint32_t {
+    NEOASTRA_REQUEST_SCHEMES_NONE = 0,
+    NEOASTRA_REQUEST_HTTP = 1, NEOASTRA_REQUEST_HTTPS = 2,
+    NEOASTRA_REQUEST_WS = 4, NEOASTRA_REQUEST_WSS = 8
+} neoastra_request_schemes_t;
+/** Coverage bits in NEOASTRA_CAPABILITY_REQUEST_FILTER. Missing classes are not guaranteed.
+    SUBRESOURCES, FRAMES and PER_VIEW are the minimum for a nonempty filter. */
+typedef enum neoastra_request_filter_flags : uint64_t {
+    NEOASTRA_REQUEST_FILTER_NONE = 0,
+    NEOASTRA_REQUEST_FILTER_SUBRESOURCES = 1, NEOASTRA_REQUEST_FILTER_FRAMES = 2,
+    NEOASTRA_REQUEST_FILTER_WEBSOCKETS = 4, NEOASTRA_REQUEST_FILTER_REDIRECTS = 8,
+    NEOASTRA_REQUEST_FILTER_SERVICE_WORKERS = 16, NEOASTRA_REQUEST_FILTER_SHARED_WORKERS = 32,
+    NEOASTRA_REQUEST_FILTER_PER_VIEW = 64, NEOASTRA_REQUEST_FILTER_REPORTS_REFUSALS = 128,
+    NEOASTRA_REQUEST_FILTER_RESOURCE_KINDS = 256, NEOASTRA_REQUEST_FILTER_DEDICATED_WORKERS = 512
+} neoastra_request_filter_flags_t;
+/** Select all resource kinds, including kinds an engine does not classify. Other masks use 1u << neoastra_resource_kind_t. */
+#define NEOASTRA_REQUEST_KINDS_ALL UINT32_MAX
 typedef enum neoastra_resource_body_kind : uint32_t { NEOASTRA_RESOURCE_BODY_EMPTY = 0, NEOASTRA_RESOURCE_BODY_BYTES = 1, NEOASTRA_RESOURCE_BODY_FILE = 2 } neoastra_resource_body_kind_t;
 typedef enum neoastra_bridge_policy : uint32_t { NEOASTRA_BRIDGE_DISABLED = 0, NEOASTRA_BRIDGE_TRUSTED_ORIGINS = 1, NEOASTRA_BRIDGE_TRUST_ENTIRE_VIEW = 2 } neoastra_bridge_policy_t;
 /** Encoding of a captured view image. */
@@ -192,6 +217,8 @@ typedef uint64_t neoastra_data_kind_t;
 #define NEOASTRA_BUILD_FEATURE_MESSAGE_BATCH (UINT64_C(1) << 3)
 #define NEOASTRA_BUILD_FEATURE_DISPLAYS (UINT64_C(1) << 4)
 #define NEOASTRA_BUILD_FEATURE_SCRIPT_WORLD_CHANNEL (UINT64_C(1) << 5)
+/** The request-filter export and version 2 view options exist; query the capability separately for engine support. */
+#define NEOASTRA_BUILD_FEATURE_REQUEST_FILTER (UINT64_C(1) << 6)
 /* Bits of neoastra_display_info_t.flags. PRIMARY marks the one primary display. WORK_AREA_REPORTED says that the platform told
    the part of the display that the menu bar, the taskbar, the Dock, or the panels leave to windows; without it the work area is
    the bounds (GTK on Wayland). ID_PERSISTENT says that the identifier comes from the monitor and its connection and is the same
@@ -228,7 +255,26 @@ typedef struct neoastra_profile_options { uint32_t size; uint32_t version; neoas
 typedef struct neoastra_window_options { uint32_t size; uint32_t version; neoastra_string_view_t title; neoastra_rect_t bounds; neoastra_size_t minimum_size; neoastra_size_t maximum_size; neoastra_window_t* owner; neoastra_window_state_t state; uint32_t flags; neoastra_color_t background_color; } neoastra_window_options_t;
 /** Title-bar configuration and layout in logical units. A zero height selects the platform default, a zero-alpha symbol color follows the system theme, and a zero-alpha background is transparent. The insets are outputs describing space reserved for native window controls. */
 typedef struct neoastra_title_bar { uint32_t size; uint32_t version; neoastra_title_bar_style_t style; int32_t height; neoastra_color_t symbol_color; neoastra_color_t background_color; int32_t left_inset; int32_t right_inset; } neoastra_title_bar_t;
-typedef struct neoastra_view_options { uint32_t size; uint32_t version; neoastra_profile_t* profile; neoastra_native_parent_t parent; neoastra_window_t* window; neoastra_rect_t bounds; uint32_t fill_parent; uint32_t maximum_message_size; uint64_t decision_timeout_ms; neoastra_decision_t* popup_request; uint32_t bridge_origin_count; neoastra_bridge_policy_t bridge_policy; const neoastra_string_view_t* bridge_origins; } neoastra_view_options_t;
+/** One refusal rule, version 1 and size exactly sizeof(neoastra_request_rule_t).
+    Criteria are ANDed; rules are ORed. Host is required for Exact/Suffix and absent for Any/Loopback.
+    It is canonical lowercase ASCII (IDNA done by the caller), at most 253 bytes, without IPv6 brackets.
+    Suffix accepts DNS names only. Port is -1 for any, otherwise 1..65535.
+    Schemes and kinds are nonempty masks; narrower kinds require RESOURCE_KINDS support. */
+typedef struct neoastra_request_rule {
+    uint32_t size; uint32_t version; neoastra_request_host_match_t host_match;
+    neoastra_string_view_t host; int32_t port; uint32_t schemes; uint32_t kinds;
+} neoastra_request_rule_t;
+/** Version 1 filter description. At most 256 contiguous rules; count 0 and a null rules pointer removes the filter.
+    Required flags add to the mandatory SUBRESOURCES | FRAMES | PER_VIEW baseline.
+    Input arrays and strings are copied before an accepting entry point returns. */
+typedef struct neoastra_request_filter {
+    uint32_t size; uint32_t version; const neoastra_request_rule_t* rules; uint32_t rule_count; uint64_t required_flags;
+} neoastra_request_filter_t;
+/** Version 1 ends before request_filter; it remains accepted with its original size.
+    Version 2 adds an initial filter, installed before view publication/first explicit navigation.
+    Null means empty for a regular view, or inheritance from the opener for a tracked popup.
+    A non-null empty description explicitly requests no filter. Unsupported/invalid nonempty filters fail creation. */
+typedef struct neoastra_view_options { uint32_t size; uint32_t version; neoastra_profile_t* profile; neoastra_native_parent_t parent; neoastra_window_t* window; neoastra_rect_t bounds; uint32_t fill_parent; uint32_t maximum_message_size; uint64_t decision_timeout_ms; neoastra_decision_t* popup_request; uint32_t bridge_origin_count; neoastra_bridge_policy_t bridge_policy; const neoastra_string_view_t* bridge_origins; const neoastra_request_filter_t* request_filter; } neoastra_view_options_t;
 /* A persistent script. Version 1 ends with world_name; a caller of version 1 passes the size it knows, which ends before
    binding_name. With isolated_world, the script runs in the world named world_name, or in the world "neoastra.default" when the
    name is empty; a name has 1 to 128 ASCII letters, digits, '.', '_' or '-'. Version 2 adds binding_name: the name of a binding,
@@ -412,6 +458,14 @@ NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_reload(neoastra_view_
 NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_go_back(neoastra_view_t*);
 NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_go_forward(neoastra_view_t*);
 NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_evaluate_script_async(neoastra_view_t*, neoastra_string_view_t, neoastra_string_callback_t, void*, neoastra_operation_t**, neoastra_error_t**);
+/** Replaces a view's declarative request filter on the UI thread; calls are installed in order.
+    Success completes after local installation, not acknowledgement by every engine process.
+    No zero-TCP, immediate global cut-over or cancellation of in-flight network requests is promised.
+    Cancellation before local installation prevents it; after installation its result wins.
+    A successful start delivers one callback through the UI dispatcher, including on disposal/shutdown;
+    a start error delivers none. Invalid descriptions return INVALID_ARGUMENT; missing coverage returns NOT_SUPPORTED.
+    Preparation failures keep the previous filter. An installation failure may tear down the view rather than leave it unprotected. */
+NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_set_request_filter_async(neoastra_view_t*, const neoastra_request_filter_t*, neoastra_completion_callback_t, void*, neoastra_operation_t**, neoastra_error_t**);
 NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_add_script_async(neoastra_view_t*, neoastra_string_view_t, const neoastra_script_options_t*, neoastra_string_callback_t, void*, neoastra_operation_t**, neoastra_error_t**);
 NEOASTRA_API neoastra_result_t NEOASTRA_CALL neoastra_view_remove_script(neoastra_view_t*, neoastra_string_view_t);
 /* Delivers a string to the binding of a script added with binding_name, in its world of the current main-frame document, as a

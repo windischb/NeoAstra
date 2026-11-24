@@ -26,6 +26,15 @@ APIs may still change.
 The engines do not offer the same features. [Known limitations](known-limitations.md) lists what
 differs, and `NeoEnvironment.GetCapability` tells an application what the engine it runs on supports.
 
+The request-filter rollout has macOS ARM64, native iOS and Android
+implementations with `Limited` base coverage. iOS verification used an iOS 27.2
+simulator; Android used ARM64 emulators on API 36 and 37.0. The iOS device and
+Android x64 libraries were cross-built, not run on those targets. Windows and
+GTK do not yet provide that feature. An older native library reports
+`None` through the managed version guard. See
+[request filtering](request-filter.md) rather than inferring feature coverage
+from the general platform matrix.
+
 ## Runtime requirements
 
 Every desktop platform needs:

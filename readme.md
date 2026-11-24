@@ -41,6 +41,10 @@ Large UI/.NET transfers use runtime-sized payload budgets by default, with confi
 [transport and RPC limits](doc/frontend-transport.md#lifecycle-and-limits).
 Native operation cancellation and shutdown ownership are described in the
 [lifecycle guide](doc/application-lifecycle-and-hosting.md#native-asynchronous-completion-ownership).
+[Declarative request filtering](doc/request-filter.md) has a managed API,
+a tested macOS ARM64 implementation and native iOS/Android integration
+verified on ARM64 simulators/emulators. Query coverage flags: Windows and GTK
+are not implemented yet, and this is not a network sandbox.
 
 Download policies can choose a destination asynchronously, including on Linux; timeouts and failed
 handlers safely cancel the request. See the [platform notes](doc/known-limitations.md#download-policies-on-linux).

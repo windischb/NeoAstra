@@ -282,6 +282,7 @@ neoastra_view::~neoastra_view() {
     environment->release();
 }
 void neoastra_view::destroy_ui() noexcept {
+    neo_abort_request_filters(this);
     for (;;) {
         neoastra_decision_t* decision{};
         {
@@ -369,6 +370,54 @@ bool valid_struct(const void* value, uint32_t supplied, size_t required, uint32_
     uint32_t actual_version{};
     std::memcpy(&actual_version, static_cast<const uint8_t*>(value) + sizeof(uint32_t), sizeof(actual_version));
     return actual_version >= 1 && actual_version <= version;
+}
+
+constexpr uint32_t view_options_v1_size = static_cast<uint32_t>(offsetof(neoastra_view_options_t, request_filter));
+constexpr uint64_t request_filter_base = NEOASTRA_REQUEST_FILTER_SUBRESOURCES | NEOASTRA_REQUEST_FILTER_FRAMES | NEOASTRA_REQUEST_FILTER_PER_VIEW;
+constexpr uint64_t request_filter_known_flags = 1023;
+
+bool normalize_view_options(const neoastra_view_options_t* input, neoastra_view_options_t& output) noexcept {
+    if (!input || input->size < view_options_v1_size || input->version < 1 || input->version > 2) return false;
+    if (input->version == 2 && input->size < sizeof(output)) return false;
+    std::memcpy(&output, input, view_options_v1_size);
+    output.size = sizeof(output);
+    output.version = 2;
+    output.request_filter = input->version == 2 ? input->request_filter : nullptr;
+    return true;
+}
+
+std::shared_ptr<const neo_request_filter::filter> copy_request_filter(const neoastra_request_filter_t* input) {
+    if (!valid_struct(input, input ? input->size : 0, sizeof(*input))
+        || input->rule_count > neo_request_filter::maximum_rules
+        || ((input->rule_count != 0) != (input->rules != nullptr))
+        || (input->required_flags & ~request_filter_known_flags) != 0)
+        throw std::invalid_argument("Invalid request filter description");
+    std::vector<neo_request_filter::rule> rules;
+    rules.reserve(input->rule_count);
+    for (uint32_t i = 0; i < input->rule_count; ++i) {
+        const auto& source = input->rules[i];
+        if (source.size != sizeof(source) || source.version != 1 || source.host.length > neo_request_filter::maximum_host_length
+            || !neo_valid_utf8(source.host)) throw std::invalid_argument("Invalid request filter rule");
+        rules.push_back({static_cast<neo_request_filter::host_match>(source.host_match),
+            neo_string(source.host), source.port, source.schemes, source.kinds});
+    }
+    return std::make_shared<const neo_request_filter::filter>(rules);
+}
+
+neoastra_result_t check_request_filter(const neoastra_environment_t* env, const neo_request_filter::filter& filter,
+    uint64_t required, neoastra_error_t** error) noexcept {
+    if (filter.empty()) return NEOASTRA_OK;
+    const auto supported = neo_platform_request_filter_flags(env);
+    if (((required | request_filter_base) & ~supported) != 0)
+        return neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "The backend lacks required request-filter coverage");
+    for (const auto& rule : filter.rules()) {
+        if ((rule.schemes & (neo_request_filter::ws | neo_request_filter::wss)) != 0
+            && (supported & NEOASTRA_REQUEST_FILTER_WEBSOCKETS) == 0)
+            return neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "The backend does not guarantee WebSocket filtering");
+        if (rule.kinds != neo_request_filter::all_kinds && (supported & NEOASTRA_REQUEST_FILTER_RESOURCE_KINDS) == 0)
+            return neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "The backend cannot preserve resource-kind selection");
+    }
+    return NEOASTRA_OK;
 }
 
 // Version 1 of neoastra_script_options_t ends before binding_name.
@@ -506,6 +555,7 @@ void NEOASTRA_CALL complete_profile(void* pointer) {
 struct view_completion final : neo_operation_completion {
     neoastra_view_created_callback_t callback{}; void* context{};
     neoastra_view_t* value{}; neoastra_error_t* error{}; bool popup{};
+    neoastra_result_t requested{NEOASTRA_OK};
     view_completion(neoastra_view_created_callback_t callback, void* context, neoastra_operation_t* operation,
                     neoastra_view_t* value, bool popup)
         : neo_operation_completion(value->environment->app), callback(callback), context(context), value(value), popup(popup) { accept(operation); }
@@ -515,18 +565,18 @@ struct view_completion final : neo_operation_completion {
     }
     void invoke(neoastra_operation_t* pending, bool shutdown) override {
         neoastra_result_t result{};
-        const auto requested = shutdown ? NEOASTRA_ERROR_CANCELED : error ? error->code : NEOASTRA_OK;
-        if (pending->try_complete(requested, result)) {
+        const auto desired = shutdown ? NEOASTRA_ERROR_CANCELED : requested;
+        if (pending->try_complete(desired, result)) {
             auto* transferred = result == NEOASTRA_OK ? std::exchange(value, nullptr) : nullptr;
-            callback(context, result, transferred, !shutdown && result == requested ? error : nullptr);
+            callback(context, result, transferred, !shutdown && result == desired ? error : nullptr);
         }
         callback = nullptr;
         context = nullptr;
     }
 };
-void platform_view_created(void* pointer, neoastra_error_t* error) noexcept {
-    auto* state = static_cast<view_completion*>(pointer);
+void finish_view_creation(view_completion* state, neoastra_error_t* error) noexcept {
     state->error = error;
+    if (error) state->requested = error->code;
     state->submit();
     if (state->popup && check_ui(state->app)) {
         // WKWebView and WebKitGTK require a popup target before their synchronous
@@ -534,6 +584,32 @@ void platform_view_created(void* pointer, neoastra_error_t* error) noexcept {
         state->deliver_inline();
     }
     state->release();
+}
+
+void NEOASTRA_CALL initial_filter_installed(void* pointer, neoastra_result_t result, const neoastra_error_t* error) {
+    auto* state = static_cast<view_completion*>(pointer);
+    state->requested = result;
+    auto* owned_error = const_cast<neoastra_error_t*>(error);
+    if (owned_error) owned_error->retain();
+    finish_view_creation(state, owned_error);
+}
+
+void platform_view_created(void* pointer, neoastra_error_t* error) noexcept {
+    auto* state = static_cast<view_completion*>(pointer);
+    const auto rules = std::atomic_load(&state->value->request_filter);
+    if (!error && state->requested == NEOASTRA_OK && !state->popup && rules && !rules->empty()) {
+        // The native view exists but has not been published and cannot navigate
+        // yet. A popup instead needs its prepared list in the backend's synchronous
+        // construction path, before that engine can start its initial request.
+        neoastra_operation_t* operation{};
+        try { operation = new neoastra_operation; }
+        catch (...) { state->requested = NEOASTRA_ERROR_NATIVE_FAILURE; finish_view_creation(state, nullptr); return; }
+        const auto result = neo_start_request_filter(state->value, rules, initial_filter_installed, state, operation, &error);
+        if (result == NEOASTRA_OK) return; // The filter callback now owns the creation source.
+        operation->release();
+        state->requested = result;
+    }
+    finish_view_creation(state, error);
 }
 
 neoastra_operation_t* make_operation(neoastra_operation_t** output) {
@@ -1101,7 +1177,7 @@ neoastra_result_t NEOASTRA_CALL neoastra_get_runtime_info(neoastra_runtime_info_
     static const std::string version="system";
     info->backend_name=neo_string_view(backend); info->backend_version=neo_string_view(version);
     info->browser_version=neo_string_view(version); info->operating_system=neo_string_view(os);
-    info->architecture=neo_string_view(architecture); info->build_features=NEOASTRA_BUILD_FEATURE_EXTERNAL_OPEN_CHECK|NEOASTRA_BUILD_FEATURE_HISTORY_NAVIGATION|NEOASTRA_BUILD_FEATURE_NAVIGATION_COMMIT|NEOASTRA_BUILD_FEATURE_MESSAGE_BATCH|NEOASTRA_BUILD_FEATURE_DISPLAYS|NEOASTRA_BUILD_FEATURE_SCRIPT_WORLD_CHANNEL;
+    info->architecture=neo_string_view(architecture); info->build_features=NEOASTRA_BUILD_FEATURE_EXTERNAL_OPEN_CHECK|NEOASTRA_BUILD_FEATURE_HISTORY_NAVIGATION|NEOASTRA_BUILD_FEATURE_NAVIGATION_COMMIT|NEOASTRA_BUILD_FEATURE_MESSAGE_BATCH|NEOASTRA_BUILD_FEATURE_DISPLAYS|NEOASTRA_BUILD_FEATURE_SCRIPT_WORLD_CHANNEL|NEOASTRA_BUILD_FEATURE_REQUEST_FILTER;
 #ifdef NDEBUG
     info->debug_build=0;
 #else
@@ -1432,13 +1508,119 @@ neoastra_result_t NEOASTRA_CALL neoastra_environment_create_async(neoastra_app_t
 neoastra_result_t NEOASTRA_CALL neoastra_environment_create_profile_async(neoastra_environment_t* env,const neoastra_profile_options_t* options,neoastra_profile_created_callback_t callback,void* context,neoastra_operation_t** outop,neoastra_error_t** error){
     if(outop)*outop=nullptr;if(!env||!callback||!valid_struct(options,options?options->size:0,sizeof(*options))||!neo_valid_utf8(options->name))return neo_fail(error,NEOASTRA_ERROR_INVALID_ARGUMENT,"invalid profile arguments");if(!check_ui(env->app))return neo_fail(error,NEOASTRA_ERROR_WRONG_THREAD,"profile creation must begin on the UI thread");if(!accepts_ui_objects(env->app))return neo_fail(error,NEOASTRA_ERROR_DISPOSED,"application shutdown has begun");
     try{auto* op=make_operation(outop);auto* value=new neoastra_profile(env);value->name=neo_string(options->name);value->ephemeral=options->ephemeral!=0;if(!neo_platform_profile_create(value,error)){value->release();op->release();if(outop&&*outop){(*outop)->release();*outop=nullptr;}return error&&*error?(*error)->code:NEOASTRA_ERROR_NATIVE_FAILURE;}auto* state=new profile_completion{callback,context,op,value};auto r=schedule(env->app,complete_profile,state,error,"could not schedule profile completion");if(r!=NEOASTRA_OK){value->release();op->release();delete state;if(outop&&*outop){(*outop)->release();*outop=nullptr;}}return r;}catch(const std::exception& ex){return neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,ex.what());}}
-neoastra_result_t NEOASTRA_CALL neoastra_environment_create_view_async(neoastra_environment_t* env,const neoastra_view_options_t* options,neoastra_view_created_callback_t callback,void* context,neoastra_operation_t** outop,neoastra_error_t** error){
-    if(outop)*outop=nullptr;if(!env||!callback||!valid_struct(options,options?options->size:0,sizeof(*options))||!valid_native_parent(options->parent)||options->maximum_message_size>NEOASTRA_HARD_MAXIMUM_MESSAGE_SIZE||options->decision_timeout_ms>600000||options->bridge_policy>NEOASTRA_BRIDGE_TRUST_ENTIRE_VIEW||((options->bridge_origin_count!=0)!=(options->bridge_origins!=nullptr))||(options->bridge_policy==NEOASTRA_BRIDGE_DISABLED&&options->bridge_origin_count!=0)||(options->bridge_policy==NEOASTRA_BRIDGE_TRUSTED_ORIGINS&&options->bridge_origin_count==0)||(options->bridge_policy==NEOASTRA_BRIDGE_TRUST_ENTIRE_VIEW&&options->bridge_origin_count!=0))return neo_fail(error,NEOASTRA_ERROR_INVALID_ARGUMENT,"invalid view arguments");for(uint32_t index=0;index<options->bridge_origin_count;++index)if(!neo_valid_utf8(options->bridge_origins[index])||!valid_origin(neo_string(options->bridge_origins[index])))return neo_fail(error,NEOASTRA_ERROR_INVALID_ARGUMENT,"invalid bridge origin");if(!check_ui(env->app))return neo_fail(error,NEOASTRA_ERROR_WRONG_THREAD,"view creation must begin on the UI thread");if(!accepts_ui_objects(env->app))return neo_fail(error,NEOASTRA_ERROR_DISPOSED,"application shutdown has begun");
-    if(options->profile&&options->profile->environment!=env)return neo_fail(error,NEOASTRA_ERROR_INVALID_ARGUMENT,"view profile belongs to a different environment");
-    if(options->popup_request){auto* request=options->popup_request;if(request->kind!=NEOASTRA_DECISION_NEW_WINDOW||request->owner==nullptr||request->owner->environment!=env||options->profile!=request->owner->profile||request->state.load(std::memory_order_acquire)>neo_decision_state::deferred)return neo_fail(error,NEOASTRA_ERROR_INVALID_STATE,"popup request is no longer valid or opener-compatible");if(request->popup_creation_started.exchange(true,std::memory_order_acq_rel))return neo_fail(error,NEOASTRA_ERROR_INVALID_STATE,"popup target creation has already started");}
-    try{auto* op=make_operation(outop);auto* value=new neoastra_view(env);value->profile=options->profile;if(value->profile)value->profile->retain();value->window=options->window;if(value->window){value->window->retain();auto& views=value->window->views;views.insert(options->fill_parent?std::find_if(views.begin(),views.end(),[](const neoastra_view_t* other){return !other->fill_parent;}):views.end(),value);}value->parent=options->parent;value->bounds=options->bounds;value->fill_parent=options->fill_parent!=0;if(options->maximum_message_size)value->maximum_message_size=options->maximum_message_size;value->bridge_policy=options->bridge_policy;if(options->decision_timeout_ms)value->decision_timeout=std::chrono::milliseconds(options->decision_timeout_ms);value->bridge_origins.reserve(options->bridge_origin_count);for(uint32_t index=0;index<options->bridge_origin_count;++index)value->bridge_origins.push_back(neo_string(options->bridge_origins[index]));auto* state=new view_completion(callback,context,op,value,options->popup_request!=nullptr);neoastra_error_t* start_error=nullptr;if(!neo_platform_view_create_async(value,options,platform_view_created,state,&start_error))platform_view_created(state,start_error);return NEOASTRA_OK;}catch(const std::exception& ex){return neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,ex.what());}}
+neoastra_result_t NEOASTRA_CALL neoastra_environment_create_view_async(neoastra_environment_t* env,
+    const neoastra_view_options_t* supplied, neoastra_view_created_callback_t callback, void* context,
+    neoastra_operation_t** outop, neoastra_error_t** error) {
+    if (outop) *outop = nullptr;
+    neoastra_view_options_t options{};
+    if (!env || !callback || !normalize_view_options(supplied, options) || !valid_native_parent(options.parent)
+        || options.maximum_message_size > NEOASTRA_HARD_MAXIMUM_MESSAGE_SIZE || options.decision_timeout_ms > 600000
+        || options.bridge_policy > NEOASTRA_BRIDGE_TRUST_ENTIRE_VIEW
+        || ((options.bridge_origin_count != 0) != (options.bridge_origins != nullptr))
+        || (options.bridge_policy == NEOASTRA_BRIDGE_DISABLED && options.bridge_origin_count != 0)
+        || (options.bridge_policy == NEOASTRA_BRIDGE_TRUSTED_ORIGINS && options.bridge_origin_count == 0)
+        || (options.bridge_policy == NEOASTRA_BRIDGE_TRUST_ENTIRE_VIEW && options.bridge_origin_count != 0))
+        return neo_fail(error, NEOASTRA_ERROR_INVALID_ARGUMENT, "invalid view arguments");
+    try {
+        std::vector<std::string> origins;
+        origins.reserve(options.bridge_origin_count);
+        for (uint32_t i = 0; i < options.bridge_origin_count; ++i) {
+            auto origin = neo_string(options.bridge_origins[i]);
+            if (!valid_origin(origin)) return neo_fail(error, NEOASTRA_ERROR_INVALID_ARGUMENT, "invalid bridge origin");
+            origins.push_back(std::move(origin));
+        }
+        // Validate all copied arguments before dereferencing object handles, as
+        // the V1 entry point did for bridge origins.
+        auto rules = options.request_filter ? copy_request_filter(options.request_filter)
+            : std::shared_ptr<const neo_request_filter::filter>{};
+        if (!check_ui(env->app)) return neo_fail(error, NEOASTRA_ERROR_WRONG_THREAD, "view creation must begin on the UI thread");
+        if (!accepts_ui_objects(env->app) || env->ui_destroyed.load(std::memory_order_acquire))
+            return neo_fail(error, NEOASTRA_ERROR_DISPOSED, "environment or application is shutting down");
+        if (options.profile && options.profile->environment != env)
+            return neo_fail(error, NEOASTRA_ERROR_INVALID_ARGUMENT, "view profile belongs to a different environment");
+        auto* popup = options.popup_request;
+        if (popup && (popup->kind != NEOASTRA_DECISION_NEW_WINDOW || !popup->owner || popup->owner->environment != env
+            || options.profile != popup->owner->profile || popup->state.load(std::memory_order_acquire) > neo_decision_state::deferred))
+            return neo_fail(error, NEOASTRA_ERROR_INVALID_STATE, "popup request is no longer valid or opener-compatible");
+        if (!options.request_filter && popup) rules = std::atomic_load(&popup->owner->request_filter);
+        if (rules) {
+            const auto checked = check_request_filter(env, *rules, options.request_filter ? options.request_filter->required_flags : 0, error);
+            if (checked != NEOASTRA_OK) return checked;
+        }
+        if (popup && popup->popup_creation_started.exchange(true, std::memory_order_acq_rel))
+            return neo_fail(error, NEOASTRA_ERROR_INVALID_STATE, "popup target creation has already started");
+        std::unique_ptr<neoastra_operation_t, decltype(&release<neoastra_operation_t>)> op(make_operation(outop), release<neoastra_operation_t>);
+        std::unique_ptr<neoastra_view_t, decltype(&release<neoastra_view_t>)> value(new neoastra_view(env), release<neoastra_view_t>);
+        value->profile = options.profile;
+        if (value->profile) value->profile->retain();
+        value->window = options.window;
+        if (value->window) {
+            value->window->retain();
+            auto& views = value->window->views;
+            views.insert(options.fill_parent ? std::find_if(views.begin(), views.end(),
+                [](const neoastra_view_t* other) { return !other->fill_parent; }) : views.end(), value.get());
+        }
+        value->parent = options.parent;
+        value->bounds = options.bounds;
+        value->fill_parent = options.fill_parent != 0;
+        if (options.maximum_message_size) value->maximum_message_size = options.maximum_message_size;
+        value->bridge_policy = options.bridge_policy;
+        if (options.decision_timeout_ms) value->decision_timeout = std::chrono::milliseconds(options.decision_timeout_ms);
+        value->bridge_origins = std::move(origins);
+        std::atomic_store(&value->request_filter, std::move(rules));
+        auto* state = new view_completion(callback, context, op.get(), value.get(), popup != nullptr);
+        op.release();
+        value.release();
+        // All filter data is owned by the view now; backends must not retain a
+        // caller's descriptor while an engine creates its controller asynchronously.
+        options.request_filter = nullptr;
+        neoastra_error_t* start_error{};
+        if (!neo_platform_view_create_async(state->value, &options, platform_view_created, state, &start_error)) {
+            state->requested = start_error ? start_error->code : NEOASTRA_ERROR_NATIVE_FAILURE;
+            platform_view_created(state, start_error);
+        }
+        return NEOASTRA_OK;
+    } catch (const std::invalid_argument& exception) {
+        if (outop && *outop) { (*outop)->release(); *outop = nullptr; }
+        return neo_fail(error, NEOASTRA_ERROR_INVALID_ARGUMENT, exception.what());
+    } catch (const std::exception& exception) {
+        if (outop && *outop) { (*outop)->release(); *outop = nullptr; }
+        return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, exception.what());
+    }
+}
+
+neoastra_result_t NEOASTRA_CALL neoastra_view_set_request_filter_async(neoastra_view_t* view,
+    const neoastra_request_filter_t* description, neoastra_completion_callback_t callback, void* context,
+    neoastra_operation_t** output, neoastra_error_t** error) {
+    if (output) *output = nullptr;
+    if (!view || !description || !callback)
+        return neo_fail(error, NEOASTRA_ERROR_INVALID_ARGUMENT, "A view, filter and callback are required");
+    neo_retain_guard owner(view);
+    if (!owner || view->ui_destroyed.load(std::memory_order_acquire))
+        return neo_fail(error, NEOASTRA_ERROR_DISPOSED, "The view is disposed");
+    if (!check_ui(view->environment->app))
+        return neo_fail(error, NEOASTRA_ERROR_WRONG_THREAD, "Request filters must be installed on the UI thread");
+    if (!accepts_ui_objects(view->environment->app))
+        return neo_fail(error, NEOASTRA_ERROR_DISPOSED, "Application shutdown has begun");
+    try {
+        auto rules = copy_request_filter(description);
+        const auto supported = check_request_filter(view->environment, *rules, description->required_flags, error);
+        if (supported != NEOASTRA_OK) return supported;
+        auto* operation = make_operation(output);
+        const auto result = neo_start_request_filter(view, std::move(rules), callback, context, operation, error);
+        if (result != NEOASTRA_OK) {
+            operation->release();
+            if (output && *output) { (*output)->release(); *output = nullptr; }
+        }
+        return result;
+    } catch (const std::invalid_argument& exception) {
+        return neo_fail(error, NEOASTRA_ERROR_INVALID_ARGUMENT, exception.what());
+    } catch (const std::exception& exception) {
+        return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, exception.what());
+    }
+}
 neoastra_result_t NEOASTRA_CALL neoastra_environment_get_capability(const neoastra_environment_t* env,neoastra_capability_t capability,neoastra_capability_info_t* info){
-    if(!env||capability<NEOASTRA_CAPABILITY_CUSTOM_SCHEME||capability>NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL||!valid_struct(info,info?info->size:0,sizeof(*info)))return NEOASTRA_ERROR_INVALID_ARGUMENT;
+    if(!env||capability<NEOASTRA_CAPABILITY_CUSTOM_SCHEME||capability>NEOASTRA_CAPABILITY_REQUEST_FILTER||!valid_struct(info,info?info->size:0,sizeof(*info)))return NEOASTRA_ERROR_INVALID_ARGUMENT;
     static const std::string available="Implemented by the active NeoAstra backend";
     static const std::string unavailable="Not exposed by the current portable implementation";
 #if defined(__linux__)
@@ -1446,6 +1628,17 @@ neoastra_result_t NEOASTRA_CALL neoastra_environment_get_capability(const neoast
     static const std::string linux_message_origin="WebKitGTK 6.0 script messages do not expose trustworthy source-origin data";
 #endif
     info->support=NEOASTRA_SUPPORT_NONE;info->capability_version=1;info->flags=0;
+    if (capability == NEOASTRA_CAPABILITY_REQUEST_FILTER) {
+        static const std::string request_filter_details =
+            "Declarative request refusal with the reported coverage; updates complete after local installation, not global engine propagation";
+        info->flags = neo_platform_request_filter_flags(env);
+        constexpr auto complete = request_filter_known_flags & ~NEOASTRA_REQUEST_FILTER_REPORTS_REFUSALS;
+        info->support = (info->flags & request_filter_base) != request_filter_base ? NEOASTRA_SUPPORT_NONE
+            : (info->flags & complete) == complete ? NEOASTRA_SUPPORT_NATIVE : NEOASTRA_SUPPORT_LIMITED;
+        if (info->support == NEOASTRA_SUPPORT_NONE) info->flags = 0;
+        info->details = neo_string_view(info->support == NEOASTRA_SUPPORT_NONE ? unavailable : request_filter_details);
+        return NEOASTRA_OK;
+    }
     // An isolated world and its binding come together or not at all; a backend without them never falls back to the page.
     if(capability==NEOASTRA_CAPABILITY_SCRIPT_ISOLATED_WORLD||capability==NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL){
         info->support=neo_platform_script_worlds_supported()?NEOASTRA_SUPPORT_NATIVE:NEOASTRA_SUPPORT_NONE;

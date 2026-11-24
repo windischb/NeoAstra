@@ -476,6 +476,28 @@ jobject JNICALL on_resource(JNIEnv* env, jclass, jlong pointer, jstring url, jst
     }
 }
 
+jboolean JNICALL on_request_filter(JNIEnv* env, jclass, jlong pointer, jstring url, jboolean main_frame) {
+    auto* view = reinterpret_cast<neoastra_view_t*>(pointer);
+    // Java's per-view gate prevents pointer reuse across this call and destroy().
+    // Copy under the live registry lock, then match without retaining the view:
+    // a stream of requests must not postpone its last-owner disposal.
+    try {
+        std::shared_ptr<const neo_request_filter::filter> rules;
+        std::string uri;
+        {
+            std::lock_guard lock(live_mutex);
+            if (!is_live(view) || view->ui_destroyed.load(std::memory_order_acquire)) return JNI_TRUE;
+            rules = std::atomic_load(&view->request_filter);
+            if (!rules || rules->empty()) return JNI_FALSE;
+            uri = unproject(view->environment, to_utf8(env, url));
+        }
+        return rules->refuses(uri, main_frame ? NEOASTRA_RESOURCE_DOCUMENT : NEOASTRA_RESOURCE_OTHER) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return JNI_TRUE;
+    }
+}
+
 void JNICALL on_event(JNIEnv* env, jclass, jlong pointer, jint kind, jstring url_value, jstring text_value, jint value) {
     auto* view = reinterpret_cast<neoastra_view_t*>(pointer);
     live_view owner(view);
@@ -600,6 +622,8 @@ jboolean JNICALL on_navigation(JNIEnv* env, jclass, jlong pointer, jstring url_v
     try {
         std::string uri = unproject(view->environment, to_utf8(env, url_value));
         int immediate = -1;
+        const auto rules = std::atomic_load(&view->request_filter);
+        if (rules && rules->refuses(uri, NEOASTRA_RESOURCE_DOCUMENT)) return JNI_TRUE;
         auto* context = new navigation_context{view, uri, &immediate};
         auto* decision = new neoastra_decision;
         neo_configure_decision(decision, view, NEOASTRA_DECISION_NAVIGATION, NEOASTRA_DECISION_ALLOW);
@@ -809,7 +833,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     response_class = static_cast<jclass>(env->NewGlobalRef(response));
     string_class = static_cast<jclass>(env->NewGlobalRef(string));
     host_is_supported = env->GetStaticMethodID(host_class, "isSupported", "()Z");
-    host_create = env->GetStaticMethodID(host_class, "create", "(Landroid/view/ViewGroup;J[Ljava/lang/String;Ljava/lang/String;)Lcom/neoastra/backend/NeoAstraWebHost;");
+    host_create = env->GetStaticMethodID(host_class, "create", "(Landroid/view/ViewGroup;J[Ljava/lang/String;Ljava/lang/String;Z)Lcom/neoastra/backend/NeoAstraWebHost;");
     host_set_bounds = env->GetMethodID(host_class, "setBounds", "(IIIIZ)V");
     host_place_below = env->GetMethodID(host_class, "placeBelow", "(Lcom/neoastra/backend/NeoAstraWebHost;)V");
     host_set_visible = env->GetMethodID(host_class, "setVisible", "(Z)V");
@@ -832,6 +856,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         {const_cast<char*>("nativeMessage"), const_cast<char*>("(JLjava/lang/String;Ljava/lang/String;Z)V"), reinterpret_cast<void*>(on_message)},
         {const_cast<char*>("nativeScriptMessage"), const_cast<char*>("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V"), reinterpret_cast<void*>(on_script_message)},
         {const_cast<char*>("nativeResource"), const_cast<char*>("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)Lcom/neoastra/backend/NeoAstraWebHost$Response;"), reinterpret_cast<void*>(on_resource)},
+        {const_cast<char*>("nativeRefusesRequest"), const_cast<char*>("(JLjava/lang/String;Z)Z"), reinterpret_cast<void*>(on_request_filter)},
         {const_cast<char*>("nativeEvent"), const_cast<char*>("(JILjava/lang/String;Ljava/lang/String;I)V"), reinterpret_cast<void*>(on_event)},
         {const_cast<char*>("nativeEvaluated"), const_cast<char*>("(JLjava/lang/String;)V"), reinterpret_cast<void*>(on_evaluated)},
         {const_cast<char*>("nativeCaptured"), const_cast<char*>("(J[BLjava/lang/String;)V"), reinterpret_cast<void*>(on_captured)},
@@ -926,6 +951,34 @@ neoastra_result_t neo_platform_profile_set_cookie(neoastra_profile_t*, const neo
 neoastra_result_t neo_platform_profile_delete_cookie(neoastra_profile_t*, const neoastra_cookie_t*, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t** error) noexcept { return unsupported(error, "Cookie access"); }
 neoastra_result_t neo_platform_profile_clear_data(neoastra_profile_t*, neoastra_data_kind_t, int64_t, int64_t, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t** error) noexcept { return unsupported(error, "Clearing browser data"); }
 
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t*) noexcept {
+    // Android's hook does not see subresource redirect hops. Additional request
+    // classes/resource kinds are not advertised from the limited engine probes.
+    return NEOASTRA_REQUEST_FILTER_SUBRESOURCES | NEOASTRA_REQUEST_FILTER_FRAMES | NEOASTRA_REQUEST_FILTER_PER_VIEW;
+}
+
+namespace {
+struct android_prepared_filter final : neo_prepared_request_filter {
+    neoastra_result_t install(neoastra_view_t* view, neoastra_error_t** error) noexcept override {
+        if (!view->platform || view->ui_destroyed.load(std::memory_order_acquire))
+            return neo_fail(error, NEOASTRA_ERROR_DISPOSED, "The Android view is unavailable");
+        // The common queue atomically publishes the owned snapshot immediately
+        // after this returns; JNI reads it directly, with no Java/UI round trip.
+        return NEOASTRA_OK;
+    }
+};
+}
+
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t*, const neo_request_filter::filter&,
+    neo_request_filter_prepared_callback_t callback, void* context, neoastra_error_t** error) noexcept {
+    try {
+        callback(context, std::make_unique<android_prepared_filter>(), NEOASTRA_OK, nullptr);
+        return NEOASTRA_OK;
+    } catch (...) {
+        return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, "Could not prepare the Android request filter");
+    }
+}
+
 bool neo_platform_view_create_async(neoastra_view_t* view, const neoastra_view_options_t* options, neo_platform_created_callback_t callback, void* context, neoastra_error_t** error) noexcept {
     if (options->popup_request) { unsupported(error, "A popup view"); return false; }
     JNIEnv* env = jni();
@@ -945,7 +998,7 @@ bool neo_platform_view_create_async(neoastra_view_t* view, const neoastra_view_o
             origins = string_array(env, rules);
         } else if (view->bridge_policy == NEOASTRA_BRIDGE_TRUST_ENTIRE_VIEW) origins = string_array(env, {"*"});
         jstring suffix = to_java(env, projected_suffix);
-        jobject host = env->CallStaticObjectMethod(host_class, host_create, parent, reinterpret_cast<jlong>(view), origins, suffix);
+        jobject host = env->CallStaticObjectMethod(host_class, host_create, parent, reinterpret_cast<jlong>(view), origins, suffix, JNI_TRUE);
         env->DeleteLocalRef(suffix);
         if (origins) env->DeleteLocalRef(origins);
         if (failed(env, view->environment->app, "The Android WebView could not be created") || !host) {
@@ -1022,6 +1075,9 @@ neoastra_result_t neo_platform_view_navigate(neoastra_view_t* view, const std::s
     JNIEnv* env = jni();
     if (!state || !state->host || !env) return neo_fail(error, NEOASTRA_ERROR_NOT_INITIALIZED, "The Android view is not initialized", 0, android_domain);
     try {
+        const auto rules = std::atomic_load(&view->request_filter);
+        if (rules && rules->refuses(uri, NEOASTRA_RESOURCE_DOCUMENT))
+            return neo_fail(error, NEOASTRA_ERROR_CANCELED, "Navigation refused by the request filter", 0, android_domain);
         jstring value = to_java(env, project(view->environment, uri));
         env->CallVoidMethod(state->host, host_navigate, value);
         env->DeleteLocalRef(value);

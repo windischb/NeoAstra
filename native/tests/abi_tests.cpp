@@ -109,6 +109,10 @@ static_assert(NEOASTRA_NAVIGATION_REQUEST_KIND_MASK == 0xf0 && NEOASTRA_NAVIGATI
 static_assert(NEOASTRA_NAVIGATION_REQUEST_KIND_NEW_DOCUMENT == 0x10 && NEOASTRA_NAVIGATION_REQUEST_KIND_RELOAD == 0x20 && NEOASTRA_NAVIGATION_REQUEST_KIND_BACK_FORWARD == 0x30);
 static_assert(NEOASTRA_BUILD_FEATURE_EXTERNAL_OPEN_CHECK == 1 && NEOASTRA_BUILD_FEATURE_HISTORY_NAVIGATION == 2 && NEOASTRA_BUILD_FEATURE_NAVIGATION_COMMIT == 4 && NEOASTRA_BUILD_FEATURE_MESSAGE_BATCH == 8 && NEOASTRA_BUILD_FEATURE_DISPLAYS == 16);
 static_assert(NEOASTRA_BUILD_FEATURE_SCRIPT_WORLD_CHANNEL == 32);
+static_assert(NEOASTRA_BUILD_FEATURE_REQUEST_FILTER == 64);
+static_assert(NEOASTRA_CAPABILITY_REQUEST_FILTER == 35);
+static_assert(sizeof(neoastra_request_host_match_t) == 4 && sizeof(neoastra_request_schemes_t) == 4);
+static_assert(sizeof(neoastra_request_filter_flags_t) == 8);
 static_assert(NEOASTRA_CAPABILITY_FULLSCREEN_DECISIONS == 32 && NEOASTRA_CAPABILITY_VIEW_PLACEMENT == 33 && NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL == 34);
 static_assert(NEOASTRA_LOG_CRITICAL == 5);
 static_assert((NEOASTRA_PROCESS_FAILURE_KIND_MASK & NEOASTRA_PROCESS_FAILURE_CRASHED) == 0);
@@ -135,7 +139,10 @@ static_assert(sizeof(neoastra_app_options_t) == 56 && offsetof(neoastra_app_opti
 static_assert(sizeof(neoastra_environment_options_t) == 96 && offsetof(neoastra_environment_options_t, custom_scheme_stride) == 88);
 static_assert(sizeof(neoastra_profile_options_t) == 32 && offsetof(neoastra_profile_options_t, ephemeral) == 24);
 static_assert(sizeof(neoastra_window_options_t) == 80 && offsetof(neoastra_window_options_t, background_color) == 72);
-static_assert(sizeof(neoastra_view_options_t) == 104 && offsetof(neoastra_view_options_t, bridge_policy) == 92 && offsetof(neoastra_view_options_t, bridge_origins) == 96);
+static_assert(sizeof(neoastra_view_options_t) == 112 && offsetof(neoastra_view_options_t, bridge_policy) == 92 && offsetof(neoastra_view_options_t, bridge_origins) == 96);
+static_assert(offsetof(neoastra_view_options_t, request_filter) == 104);
+static_assert(sizeof(neoastra_request_rule_t) == 48 && offsetof(neoastra_request_rule_t, host) == 16 && offsetof(neoastra_request_rule_t, port) == 32);
+static_assert(sizeof(neoastra_request_filter_t) == 32 && offsetof(neoastra_request_filter_t, required_flags) == 24);
 // Version 1 of the script options ends before binding_name, which version 2 appends: a caller of version 1 passes 40.
 static_assert(sizeof(neoastra_script_options_t) == 56 && offsetof(neoastra_script_options_t, world_name) == 24 && offsetof(neoastra_script_options_t, binding_name) == 40);
 static_assert(sizeof(neoastra_capture_options_t) == 40 && offsetof(neoastra_capture_options_t, full_page) == 16 && offsetof(neoastra_capture_options_t, region) == 24);
@@ -195,6 +202,7 @@ int main() {
     assert((info.build_features & NEOASTRA_BUILD_FEATURE_MESSAGE_BATCH) != 0);
     assert((info.build_features & NEOASTRA_BUILD_FEATURE_DISPLAYS) != 0);
     assert((info.build_features & NEOASTRA_BUILD_FEATURE_SCRIPT_WORLD_CHANNEL) != 0);
+    assert((info.build_features & NEOASTRA_BUILD_FEATURE_REQUEST_FILTER) != 0);
 
     neoastra_app_options_t options{};
     options.size = sizeof(options);
