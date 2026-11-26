@@ -160,6 +160,12 @@ Capability reports and API contracts MUST distinguish them. Events include immut
 
 Platform implementations must document WebView2 filter/session semantics, WKWebView limitations/public APIs, and WebKitGTK context behavior. No portable claim is made where one engine cannot provide equivalent authority. Custom application-scheme handling remains separate and safer for local assets.
 
+Declarative refuse-only rules are exposed separately through
+`NeoCapability.RequestFilter`, not as general `NetworkInterception` support.
+Their [contract and coverage flags](../request-filter.md) distinguish supported
+request classes. Update completion denotes local installation, not atomic
+propagation to every engine process; the API is not a socket firewall.
+
 Proxy configuration, cache/storage quota, permission persistence, and advanced session controls require per-profile semantics, restart requirements, credential handling, and capability versions.
 
 ## 10. Deep links, associations, and autostart

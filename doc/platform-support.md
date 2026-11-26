@@ -26,6 +26,15 @@ APIs may still change.
 The engines do not offer the same features. [Known limitations](known-limitations.md) lists what
 differs, and `NeoEnvironment.GetCapability` tells an application what the engine it runs on supports.
 
+Request filtering has `Limited` base coverage on macOS, iOS, Android, Linux and
+Windows; on Linux, worker isolation needs an explicitly ephemeral profile per
+view. iOS verification used an iOS 27.2 simulator; Android used ARM64 emulators
+on API 36 and 37.0. The iOS device and Android x64 libraries were cross-built,
+not run on those targets. An older native library reports `None` through the
+managed version guard. See
+[request filtering](request-filter.md) rather than inferring feature coverage
+from the general platform matrix.
+
 ## Runtime requirements
 
 Every desktop platform needs:

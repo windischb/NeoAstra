@@ -41,6 +41,10 @@ Large UI/.NET transfers use runtime-sized payload budgets by default, with confi
 [transport and RPC limits](doc/frontend-transport.md#lifecycle-and-limits).
 Native operation cancellation and shutdown ownership are described in the
 [lifecycle guide](doc/application-lifecycle-and-hosting.md#native-asynchronous-completion-ownership).
+[Declarative request filtering](doc/request-filter.md) refuses requests of a
+view to matching hosts and ports on every desktop and mobile backend, with
+coverage flags that say which request classes each engine covers. It is an
+additional protection layer, not a network sandbox.
 
 Download policies can choose a destination asynchronously, including on Linux; timeouts and failed
 handlers safely cancel the request. See the [platform notes](doc/known-limitations.md#download-policies-on-linux).

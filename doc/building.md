@@ -69,6 +69,21 @@ dotnet run --project src/NeoAstra.Conformance -c Release -- --run
 
 Add `--stress` for the bounded high-volume scenarios or `--timeout-seconds N` to change the per-scenario limit. The harness uses only copied `conformance://` fixtures and prints an explicit `SKIP` when a backend capability, trusted user activation, destructive process failure, filesystem mutation, or subprocess isolation prevents safe automation.
 
+Use `--run --request-filter-only` for the managed request-filter lifecycle checks
+alone, without the broader automation and media-capture scenarios. This focused
+mode cannot be combined with `--stress`. It includes disposable HTTPS loopback
+servers where the backend supports test-local TLS decisions; it does not access
+public servers or install certificates into system trust stores.
+
+The native [Apple request-filter probes](request-filter.md#reproduce-the-macos-probe)
+also have an iOS simulator runner, `eng/run_ios_request_filter_probe.py`. It
+creates and removes its own simulator rather than using an existing app/profile.
+The [Android integration runner](request-filter.md#reproduce-the-android-integration-probe),
+`eng/run_android_request_filter_probe.py`, builds the real Java/JNI backend from
+local SDK tools and cached dependencies, then tests it in disposable ARM64 AVDs.
+It does not use USB devices or existing emulator profiles. Pass `--https` to
+repeat the matrix with a disposable CA trusted only by the test APK.
+
 The `automation:` scenarios call the [browser automation](browser-automation.md) tools by name against a fixture whose content security policy allows no inline script. Unlike the other scenarios, each of them reports its own `FAIL` line and the following ones still run, so that one run shows everything that differs on a platform; the run fails at the end when any of them did. They keep their windows hidden, except for the last one, which shows its window to capture it, to click at coordinates, and to resize it.
 
 Two tests of `WindowsDropTargetTests` drag a page element with the real mouse of a Windows desktop, within a window and to another one, and are skipped unless `NEOASTRA_TEST_REAL_INPUT` is `1`. They take the pointer for about two seconds each, drive it from a thread of their own, release the button in every case, and let go when someone else moves the mouse. Keep their windows uncovered while they run:
@@ -95,7 +110,7 @@ The native library uses CMake presets and Clang. From the repository root, the b
 python eng/build_native.py --rid win-x64 --clean
 ```
 
-The managed project directly copies the staged library for the current host RID beside its development output, so local applications and tests use the latest native build without creating or installing a NuGet package. Rerun the helper after native changes. The same command accepts `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`; use `--skip-tests` when cross-compiling a binary that cannot run on the build host.
+The managed project directly copies the staged library for the current host RID beside its development output, so local applications and tests use the latest native build without creating or installing a NuGet package. Rerun the helper after native changes. The same command accepts `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`; use `--skip-tests` when cross-compiling a binary that cannot run on the build host. Tests labelled `browser`, the Windows request-filter suites that run real traffic through the installed WebView2 runtime for several minutes, are left out; `--browser-tests` runs only them. CI runs them in a job of their own that reports without failing the workflow. The unlabelled `neoastra_windows_request_filter_unsupported_tests` still creates views, so the ordinary Windows run needs an installed WebView2 Runtime.
 
 Native tests include a public-header ABI test, common ownership tests, a bounded dispatch-drain test (order, one callback per elapsed slice, callbacks that keep queuing, quit), contended dispatch/UI-object teardown stress tests, and an independent frozen ABI 1.7 consumer. The frozen consumer does not include the current header: it loads the shared library by path, verifies every ABI 1.7 export, calls core entry points through frozen C-layout declarations, and performs an attach/detach ownership cycle. Compatible exports added after ABI 1.7 do not change that export floor. On macOS and Linux the native tests also check which WebKit data store or network session each user-data root and profile selects; those tests create browser views and use WebKit's cookie storage, but load no page. On Linux they check as well which GTK renderer the application chooses and that the applications it opens addresses with do not get it; in a Wayland session with the NVIDIA driver and GTK 4.16 or later, they check that a window draws with GL without a warning of GTK, and say that they skip it elsewhere. They check that a destroyed view leaves its window, and that the settings of a view for the Tab key and for history navigation reach WebKitGTK. On macOS a further test loads `data:` pages in a hidden window and checks that a view reports whether it can go back and forward as its history changes, that a navigation request tells a new document, a reload, and an entry of the history apart, and that a view whose history navigation is turned off stays on its page and still reloads it; another one hands key presses and clicks to such a view: it checks that the Tab key stops on a link only while the view is set to, that a link is reported as user-initiated when the user activates it and not when a script does, and that an address sent outside the view reaches the system only when it is a web address. That test takes the place of `NSWorkspace`, so no browser opens. A last one zooms such a view and checks that its page is laid out again in a viewport of the size of the view divided by the zoom and still fills the view, and that a view keeps its zoom from before its first document on, through a new document and a reload.
 
