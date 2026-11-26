@@ -1,4 +1,5 @@
 #include "../common/native_internal.hpp"
+#include "../common/apple_request_filter.hpp"
 
 #import <Cocoa/Cocoa.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -164,6 +165,8 @@ struct cocoa_view {
     std::unordered_map<std::string,WKUserScript*> scripts;
     // The bindings of the scripts that have one, by the identifier of the script.
     std::unordered_map<std::string,NeoAstraScriptChannel*> channels;
+    std::shared_ptr<neo_apple_filter::store> filter_store;
+    std::shared_ptr<neo_apple_filter::entry> filter_entry;
     uint64_t history{};
     ~cocoa_view();
 };
@@ -748,6 +751,23 @@ bool neo_platform_view_create_async(neoastra_view_t* view,const neoastra_view_op
                     if (!content) throw std::bad_alloc();
                     for (WKUserScript* script in configuration.userContentController.userScripts) [content addUserScript:script];
                     configuration.userContentController=content;
+                    const auto rules = std::atomic_load(&view->request_filter);
+                    if (rules && !rules->empty()) {
+                        auto* opener = options->popup_request->owner;
+                        auto* opener_state = opener ? static_cast<cocoa_view*>(opener->platform) : nullptr;
+                        const auto inherited = opener ? std::atomic_load(&opener->request_filter) : nullptr;
+                        // WKWebView requires a popup synchronously. Reuse the
+                        // opener's immutable compiled entry, never its controller.
+                        if (!opener_state || !opener_state->filter_entry || !inherited
+                            || rules->rules().size() != inherited->rules().size()
+                            || !std::equal(rules->rules().begin(), rules->rules().end(), inherited->rules().begin())) {
+                            neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "A filtered popup requires the opener's prepared rule list");
+                            return false;
+                        }
+                        state->filter_store = opener_state->filter_store;
+                        state->filter_entry = opener_state->filter_entry;
+                        [content addContentRuleList:state->filter_entry->list];
+                    }
                 }
                 if (view->bridge_policy != NEOASTRA_BRIDGE_DISABLED)
                     [configuration.userContentController addScriptMessageHandler:state->delegate name:@"_neoastra_transport_v1"];
@@ -828,6 +848,20 @@ cocoa_view::~cocoa_view() {
 bool neo_platform_script_worlds_supported() noexcept {
     if(@available(macOS 11.0,*))return true;
     return false;
+}
+
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t*) noexcept {
+    if (@available(macOS 10.13, *)) {
+        // Additional classes need their own conformance evidence; the ABI's
+        // presence or a broad content-list pattern alone does not promise them.
+        return NEOASTRA_REQUEST_FILTER_SUBRESOURCES | NEOASTRA_REQUEST_FILTER_FRAMES | NEOASTRA_REQUEST_FILTER_PER_VIEW;
+    }
+    return 0;
+}
+
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t* view, const neo_request_filter::filter& rules,
+    neo_request_filter_prepared_callback_t callback, void* context, neoastra_error_t** error) noexcept {
+    return neo_apple_filter::prepare<cocoa_view>(view, rules, callback, context, error);
 }
 
 void neo_platform_view_destroy(neoastra_view_t* view) noexcept {@autoreleasepool{auto* state=static_cast<cocoa_view*>(view->platform);if(!state)return;@try{[state->webview removeObserver:state->delegate forKeyPath:@"title"];[state->webview removeObserver:state->delegate forKeyPath:@"URL"];[state->webview removeObserver:state->delegate forKeyPath:@"canGoBack"];[state->webview removeObserver:state->delegate forKeyPath:@"canGoForward"];}@catch(NSException*){}((NeoAstraWebView*)state->webview).nativeView=nullptr;state->delegate.nativeView=nullptr;state->webview.navigationDelegate=nil;state->webview.UIDelegate=nil;if(view->bridge_policy!=NEOASTRA_BRIDGE_DISABLED)[state->webview.configuration.userContentController removeScriptMessageHandlerForName:@"_neoastra_transport_v1"];remove_script_channels(state);[state->webview removeFromSuperview];delete state;view->platform=nullptr;}}

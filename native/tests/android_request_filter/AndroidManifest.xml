@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The request-filter probe application. eng/run_android_request_filter_probe.py merges the manifest of the backend
+     (native/src/android/java/AndroidManifest.xml) and those of the AndroidX libraries into it, as a .NET Android build does.
+     The test servers are reached in plain HTTP on 127.0.0.1 through this emulator's adb reverse mappings. The activity handles configuration
+     changes itself: a recreated activity would run the probe a second time in the same process. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.neoastra.filtertest">
+  <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="36" />
+  <uses-permission android:name="android.permission.INTERNET" />
+  <application
+      android:label="NeoAstra request filter probe"
+      android:usesCleartextTraffic="true"
+      android:extractNativeLibs="true">
+    <activity
+        android:name="io.neoastra.filtertest.ProbeActivity"
+        android:exported="true"
+        android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale|touchscreen|colorMode|mcc|mnc" />
+  </application>
+</manifest>

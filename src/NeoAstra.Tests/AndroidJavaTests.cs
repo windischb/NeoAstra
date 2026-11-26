@@ -10,6 +10,13 @@ namespace NeoAstra.Tests;
 public sealed class AndroidJavaTests
 {
     [TestMethod]
+    public async Task RequestFilterGate_DrainsChecksBeforeDisposalAndKeepsOldLibrariesCompatible()
+    {
+        var output = await RunJavaCheckAsync("NeoAstraRequestFilterGate.java", "NeoAstraRequestFilterGateCheck");
+        StringAssert.Contains(output, "NeoAstraRequestFilterGate: ok");
+    }
+
+    [TestMethod]
     public async Task DebuggingSwitch_IsOnWhileAnyViewAsksAndSurvivesAFailingSwitch()
     {
         var output = await RunJavaCheckAsync("NeoAstraDebuggingSwitch.java", "NeoAstraDebuggingSwitchCheck");

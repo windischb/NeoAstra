@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>org.neoastra.tests.request-filter</string>
+    <key>CFBundleExecutable</key><string>neoastra_ios_request_filter_probe</string>
+    <key>CFBundleName</key><string>NeoAstra Request Filter Probe</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>MinimumOSVersion</key><string>15.0</string>
+    <key>LSRequiresIPhoneOS</key><true/>
+    <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+    <key>UILaunchScreen</key><dict/>
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key><false/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array><dict>
+                <key>UISceneConfigurationName</key><string>Probe</string>
+                <key>UISceneDelegateClassName</key><string>NeoRequestFilterProbeScene</string>
+            </dict></array>
+        </dict>
+    </dict>
+    <!-- Test-local loopback HTTP fixtures, never a production TLS-policy change. -->
+    <key>NSAppTransportSecurity</key>
+    <dict><key>NSAllowsLocalNetworking</key><true/></dict>
+</dict>
+</plist>

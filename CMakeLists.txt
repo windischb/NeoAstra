@@ -4,6 +4,8 @@ project(NeoAstra VERSION 0.1.0 LANGUAGES C CXX)
 
 option(NEOASTRA_BUILD_SHARED "Build the NeoAstra shared library" ON)
 option(NEOASTRA_BUILD_TESTS "Build native tests" OFF)
+option(NEOASTRA_BUILD_IOS_REQUEST_FILTER_PROBE "Build the standalone UIKit request-filter probe app" OFF)
+option(NEOASTRA_BUILD_ANDROID_REQUEST_FILTER_PROBE "Build the Android request-filter JNI test driver" OFF)
 option(NEOASTRA_BUILD_SAMPLES "Build native samples" OFF)
 option(NEOASTRA_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(NEOASTRA_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
@@ -72,8 +74,9 @@ if(WIN32)
   list(APPEND neoastra_common_libraries ws2_32)
 endif()
 add_library(neoastra_native ${_neo_library_type} ${neoastra_common_sources})
-# Backends without their own request filter report no coverage and refuse nonempty filters.
-target_sources(neoastra_native PRIVATE native/src/common/request_filter_unsupported.cpp)
+if(NOT APPLE AND NOT ANDROID)
+  target_sources(neoastra_native PRIVATE native/src/common/request_filter_unsupported.cpp)
+endif()
 target_compile_definitions(neoastra_native PRIVATE NEOASTRA_BUILD=1)
 target_include_directories(neoastra_native PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
@@ -165,6 +168,22 @@ if(NEOASTRA_ENABLE_LTO AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
   if(_neo_ipo_supported)
     set_property(TARGET neoastra_native PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   endif()
+endif()
+
+if(ANDROID AND NEOASTRA_BUILD_ANDROID_REQUEST_FILTER_PROBE)
+  add_library(neoastra_android_request_filter_probe SHARED native/tests/android_request_filter/probe.cpp)
+  target_link_libraries(neoastra_android_request_filter_probe PRIVATE neoastra_native)
+endif()
+
+if(IOS AND NEOASTRA_BUILD_IOS_REQUEST_FILTER_PROBE)
+  add_executable(neoastra_ios_request_filter_probe MACOSX_BUNDLE
+    native/tests/apple_request_filter_probe.mm native/src/common/request_filter.cpp)
+  target_include_directories(neoastra_ios_request_filter_probe PRIVATE native/src/common)
+  target_compile_options(neoastra_ios_request_filter_probe PRIVATE -fobjc-arc -fmodules -fcxx-modules)
+  target_link_libraries(neoastra_ios_request_filter_probe PRIVATE neoastra_native
+    "-framework Foundation" "-framework UIKit" "-framework WebKit")
+  set_target_properties(neoastra_ios_request_filter_probe PROPERTIES
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/native/tests/ios_request_filter_probe.plist")
 endif()
 
 if(NEOASTRA_BUILD_TESTS)
@@ -292,6 +311,17 @@ if(NEOASTRA_BUILD_TESTS)
       neoastra_native neoastra_sanitizers "-framework Cocoa" "-framework WebKit")
     add_test(NAME neoastra_macos_script_world_tests COMMAND neoastra_macos_script_world_tests)
     set_tests_properties(neoastra_macos_script_world_tests PROPERTIES TIMEOUT 120)
+    # Diagnostic engine probes and tests of the public request-filter ABI.
+    add_executable(neoastra_macos_request_filter_probe
+      native/tests/apple_request_filter_probe.mm native/src/common/request_filter.cpp)
+    target_include_directories(neoastra_macos_request_filter_probe PRIVATE native/src/common)
+    target_compile_options(neoastra_macos_request_filter_probe PRIVATE -fobjc-arc)
+    target_link_libraries(neoastra_macos_request_filter_probe PRIVATE
+      neoastra_native neoastra_sanitizers Threads::Threads "-framework Cocoa" "-framework WebKit")
+    add_test(NAME neoastra_macos_request_filter_probe_baseline COMMAND neoastra_macos_request_filter_probe --baseline)
+    add_test(NAME neoastra_macos_request_filter_api_tests COMMAND neoastra_macos_request_filter_probe --api)
+    set_tests_properties(neoastra_macos_request_filter_probe_baseline PROPERTIES TIMEOUT 120)
+    set_tests_properties(neoastra_macos_request_filter_api_tests PROPERTIES TIMEOUT 120)
   elseif(UNIX)
     add_executable(neoastra_linux_backend_tests native/tests/linux_backend_tests.cpp)
     target_link_libraries(neoastra_linux_backend_tests PRIVATE
