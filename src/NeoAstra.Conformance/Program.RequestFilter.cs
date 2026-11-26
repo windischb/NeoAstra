@@ -91,7 +91,34 @@ internal static partial class Program
                 Require(disposed, "A queued setter ran after disposal.");
             });
 
-            if (IsSupported(environment, NeoCapability.TrackedPopups))
+            if (OperatingSystem.IsLinux())
+            {
+                await RunCaseAsync("GTK rejects a tracked popup that cannot have an independent filter", async () =>
+                {
+                    await using var opener = await environment.CreateWebViewAsync(
+                        NeoAstraHost.FillWindow(window), new NeoAstraOptions { RequestFilter = initial });
+                    await NavigateAndWaitAsync(opener, IndexUri, options.Timeout);
+                    EnableGtkProbePopups(opener);
+                    var before = opener.RequestFilter;
+                    var refused = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    opener.NewWindowRequested = async request =>
+                    {
+                        try
+                        {
+                            await using var unexpected = await request.CreateViewAsync(NeoAstraHost.FillWindow(window));
+                            refused.TrySetResult(false);
+                        }
+                        catch (NotSupportedException) { refused.TrySetResult(true); }
+                        catch (Exception error) { refused.TrySetException(error); }
+                        return NeoNewWindowDecision.Cancel;
+                    };
+                    _ = await opener.EvaluateScriptAsync("window.open('about:blank'); true");
+                    Require(await refused.Task.WaitAsync(options.Timeout), "GTK published an unsafe filtered popup.");
+                    Require(ReferenceEquals(before, opener.RequestFilter), "Popup rejection changed the opener's snapshot.");
+                    await opener.SetRequestFilterAsync(NeoRequestFilter.Empty);
+                });
+            }
+            else if (IsSupported(environment, NeoCapability.TrackedPopups))
             {
                 await RunCaseAsync("request-filter inheritance in a tracked managed popup", async () =>
                 {
@@ -122,7 +149,7 @@ internal static partial class Program
                 });
             }
 
-            if (IsSupported(environment, NeoCapability.TlsErrorDecisions))
+            if (OperatingSystem.IsLinux() || IsSupported(environment, NeoCapability.TlsErrorDecisions))
                 await RunRequestFilterTlsScenarioAsync(environment);
             else
                 Skip("managed request-filter HTTPS traffic", "This backend needs its platform-specific test-local certificate setup.");
@@ -137,19 +164,28 @@ internal static partial class Program
                 var frame = "<!doctype html><script>fetch(" + frameTarget
                     + ",{cache:'no-store'}).then(r=>parent.postMessage({tlsFrame:r.status},'*'),"
                     + "e=>parent.postMessage({tlsFrame:0},'*'));</script>";
-                await using var source = new RequestFilterTlsServer(frame);
-                await using var cross = new RequestFilterTlsServer(frame);
+                await using var source = new RequestFilterTlsServer(frame, target.Certificate);
+                await using var cross = new RequestFilterTlsServer(frame, target.Certificate);
                 await using var window = CreateHiddenWindow("NeoAstra isolated HTTPS filter probe");
                 var filter = new NeoRequestFilter { Rules = [new NeoRequestRule { Port = target.Origin.Port }] };
                 await using var filtered = await environment.CreateWebViewAsync(
                     NeoAstraHost.FillWindow(window), new NeoAstraOptions { RequestFilter = filter });
                 await using var control = await environment.CreateWebViewAsync(NeoAstraHost.FillWindow(window));
-                // Only these disposable views load our self-signed loopback pages.
-                // No system trust store, engine-wide TLS switch or user profile is changed.
-                // Some backends omit the challenge URI, so this is not an example
-                // of a certificate policy suitable for arbitrary/untrusted content.
-                filtered.TlsErrorRequested = _ => ValueTask.FromResult(NeoTlsErrorDecision.Allow);
-                control.TlsErrorRequested = _ => ValueTask.FromResult(NeoTlsErrorDecision.Allow);
+                if (OperatingSystem.IsLinux())
+                {
+                    // GTK has no managed TLS decision here. Pin only the fixture
+                    // certificate/host in this disposable private network session.
+                    AllowGtkProbeCertificate(filtered, target);
+                    AllowGtkProbeCertificate(control, target);
+                }
+                else
+                {
+                    // Only these disposable views load our self-signed loopback pages.
+                    // Some backends omit the challenge URI: this is not a policy for
+                    // arbitrary/untrusted content. No global trust setting changes.
+                    filtered.TlsErrorRequested = _ => ValueTask.FromResult(NeoTlsErrorDecision.Allow);
+                    control.TlsErrorRequested = _ => ValueTask.FromResult(NeoTlsErrorDecision.Allow);
+                }
                 await NavigateAndWaitAsync(filtered, source.Origin, options.Timeout);
                 await NavigateAndWaitAsync(control, source.Origin, options.Timeout);
                 Require((await control.EvaluateScriptAsync("document.body.textContent"))?.Contains("neoastra-tls-ready", StringComparison.Ordinal) == true,

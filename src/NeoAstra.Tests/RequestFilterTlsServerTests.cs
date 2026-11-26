@@ -8,6 +8,28 @@ namespace NeoAstra.Tests;
 public sealed class RequestFilterTlsServerTests
 {
     [TestMethod]
+    public async Task SharedCertificateCopyRemainsUsableAfterOriginalIsDisposed()
+    {
+        RequestFilterTlsServer copy;
+        await using (var original = new RequestFilterTlsServer())
+        {
+            copy = new RequestFilterTlsServer(null, original.Certificate);
+            CollectionAssert.AreEqual(original.Certificate.RawData, copy.Certificate.RawData);
+        }
+        await using (copy)
+        {
+            using var handler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
+                    certificate is not null && certificate.RawData.AsSpan().SequenceEqual(copy.Certificate.RawData),
+            };
+            using var client = new HttpClient(handler);
+            StringAssert.Contains(await client.GetStringAsync(copy.Origin), "neoastra-tls-ready");
+            Assert.AreEqual(1, copy.Requests);
+        }
+    }
+
+    [TestMethod]
     public async Task FrameDocumentIsSelectedOnlyByItsExactPath()
     {
         await using var server = new RequestFilterTlsServer("<body>frame-ä</body>");

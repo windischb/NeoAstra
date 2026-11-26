@@ -528,6 +528,7 @@ public sealed class NeoAstraOptions
     /// Null means no filter for a regular view, or inheritance from the opener for a tracked popup.
     /// Use <see cref="NeoRequestFilter.Empty"/> to explicitly disable inheritance. Inputs are snapshotted at creation.
     /// Missing backend coverage fails creation rather than silently ignoring a nonempty filter.
+    /// WebKitGTK rejects tracked popups with a nonempty inherited or explicit filter because their engine controller is not independent.
     /// </remarks>
     public NeoRequestFilter? RequestFilter { get; set; }
 

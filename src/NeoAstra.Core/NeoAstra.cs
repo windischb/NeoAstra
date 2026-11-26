@@ -114,7 +114,7 @@ public sealed class NeoAstra : IAsyncDisposable
     /// <returns>A task completed after local native installation, not a global engine-process barrier.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
     /// <exception cref="ArgumentException">The rules or requirement flags are invalid.</exception>
-    /// <exception cref="NotSupportedException">The library or backend lacks the required filter coverage.</exception>
+    /// <exception cref="NotSupportedException">The required coverage or independent view scope is unavailable. WebKitGTK rejects nonempty filters on views that have participated in a tracked-popup group.</exception>
     /// <exception cref="ObjectDisposedException">The view or application has been disposed.</exception>
     /// <exception cref="NeoAstraException">Compilation or installation failed.</exception>
     public Task SetRequestFilterAsync(NeoRequestFilter filter) => SetRequestFilterAsync(filter, CancellationToken.None);
@@ -127,10 +127,12 @@ public sealed class NeoAstra : IAsyncDisposable
     /// Inputs are snapshotted before dispatch; native installations are ordered per view.
     /// No zero-TCP guarantee, fixed propagation delay, or termination of in-flight requests is promised.
     /// Preparation errors preserve the previous filter; an uncertain native installation failure may close the view.
+    /// On WebKitGTK, a view that has participated in a tracked-popup group cannot accept a nonempty filter,
+    /// even after its related view is disposed: native widgets may outlive their managed handles.
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
     /// <exception cref="ArgumentException">The rules or requirement flags are invalid.</exception>
-    /// <exception cref="NotSupportedException">The library or backend lacks the required filter coverage.</exception>
+    /// <exception cref="NotSupportedException">The required coverage or independent view scope is unavailable.</exception>
     /// <exception cref="OperationCanceledException">Cancellation prevented installation, or application shutdown canceled the operation.</exception>
     /// <exception cref="ObjectDisposedException">The view or application has been disposed.</exception>
     /// <exception cref="NeoAstraException">Compilation or installation failed.</exception>

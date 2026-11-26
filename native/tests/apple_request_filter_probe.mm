@@ -5,6 +5,7 @@
 // that a request was stopped before reaching the server.
 #include "neoastra.h"
 #include "request_filter.hpp"
+#include "request_filter_loopback_server.hpp"
 
 #import <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -60,142 +61,10 @@ void wait_for(Predicate predicate, const char* what) {
     }
 }
 
-struct counts {
-    unsigned connections{};
-    unsigned requests{};
-    unsigned upgrades{};
-    unsigned long long bytes{};
-};
-
-bool no_request(counts value) {
-    // These listeners speak plaintext HTTP: every received byte is application
-    // data. A TCP accept alone is diagnostic, not a failure of the request contract.
-    return value.bytes == 0 && value.requests == 0 && value.upgrades == 0;
-}
-
-counts since(counts before, counts after) {
-    return {after.connections - before.connections, after.requests - before.requests,
-        after.upgrades - before.upgrades, after.bytes - before.bytes};
-}
-
-// Unlike the managed navigation fixture, this probe must also see a preconnect
-// which sends no HTTP headers. Nonblocking clients keep it from hiding later requests.
-class loopback_server final {
-public:
-    explicit loopback_server(std::string redirect = {}) : _redirect(std::move(redirect)) {
-        _listener = socket(AF_INET, SOCK_STREAM, 0);
-        check(_listener >= 0, "socket");
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        check(bind(_listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "bind loopback");
-        socklen_t size = sizeof(address);
-        check(getsockname(_listener, reinterpret_cast<sockaddr*>(&address), &size) == 0, "getsockname");
-        _port = ntohs(address.sin_port);
-        check(listen(_listener, 16) == 0, "listen");
-        check(fcntl(_listener, F_SETFL, O_NONBLOCK) == 0, "nonblocking listener");
-        _thread = std::thread([this] { serve(); });
-    }
-
-    ~loopback_server() {
-        _stopping.store(true);
-        _thread.join();
-        close(_listener);
-    }
-    loopback_server(const loopback_server&) = delete;
-    loopback_server& operator=(const loopback_server&) = delete;
-
-    uint16_t port() const { return _port; }
-    std::string origin(const char* host = "127.0.0.1") const {
-        return "http://" + std::string(host) + ":" + std::to_string(_port);
-    }
-    counts snapshot() {
-        // Drain sockets already pending at the server before inspecting a negative
-        // result. This is a server-observation barrier, not a WebKit update barrier.
-        const auto sample = ++_samples;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (_sampled.load() < sample) {
-            check(std::chrono::steady_clock::now() < deadline, "server observation");
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        return {_connections.load(), _requests.load(), _upgrades.load(), _bytes.load()};
-    }
-
-private:
-    struct client { int fd; std::string data; };
-    int _listener{-1};
-    uint16_t _port{};
-    const std::string _redirect;
-    std::atomic<bool> _stopping{};
-    std::atomic<unsigned> _connections{}, _requests{}, _upgrades{};
-    std::atomic<unsigned long long> _bytes{};
-    std::atomic<unsigned> _samples{}, _sampled{};
-    std::thread _thread;
-
-    void serve() {
-        std::vector<client> clients;
-        while (!_stopping.load()) {
-            const auto sample = _samples.load();
-            pollfd listener{_listener, POLLIN, 0};
-            const int ready = poll(&listener, 1, 10);
-            check(ready >= 0 || errno == EINTR, "poll listener");
-            while (ready > 0) {
-                const int fd = accept(_listener, nullptr, nullptr);
-                if (fd >= 0) {
-                    ++_connections;
-                    int yes = 1;
-                    check(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes)) == 0, "SO_NOSIGPIPE");
-                    timeval timeout{1, 0};
-                    check(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0, "send timeout");
-                    clients.push_back({fd, {}});
-                } else {
-                    check(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR, "accept");
-                    break;
-                }
-            }
-            for (auto it = clients.begin(); it != clients.end();) {
-                char buffer[8192];
-                const auto length = recv(it->fd, buffer, sizeof(buffer), MSG_DONTWAIT);
-                if (length > 0) {
-                    _bytes.fetch_add(static_cast<unsigned long long>(length));
-                    it->data.append(buffer, static_cast<size_t>(length));
-                }
-                const bool complete = it->data.find("\r\n\r\n") != std::string::npos;
-                if (complete) {
-                    ++_requests;
-                    auto lower = it->data;
-                    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
-                        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
-                    });
-                    const bool upgrade = lower.find("\r\nupgrade: websocket\r\n") != std::string::npos;
-                    if (upgrade) ++_upgrades;
-                    const bool redirect = !_redirect.empty() && it->data.starts_with("GET /redirect");
-                    const bool frame = !_redirect.empty() && it->data.starts_with("GET /frame");
-                    const std::string body = "<!doctype html><meta charset=utf-8><title>Request filter probe</title><body>Probe</body>" +
-                        (frame ? "<script>fetch('" + _redirect + "/frame-fetch').then(()=>{window.probeFetchResult='load';parent.postMessage('load','*')},()=>{window.probeFetchResult='error';parent.postMessage('error','*')});</script>" : "");
-                    const std::string response =
-                        (redirect ? "HTTP/1.1 302 Found\r\nLocation: " + _redirect + "/target\r\n" :
-                            upgrade ? "HTTP/1.1 400 Bad Request\r\n" : "HTTP/1.1 200 OK\r\n") +
-                        std::string("Content-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ") +
-                        std::to_string(body.size()) + "\r\n\r\n" + body;
-                    size_t sent = 0;
-                    while (sent < response.size()) {
-                        const auto n = send(it->fd, response.data() + sent, response.size() - sent, 0);
-                        if (n <= 0) break; // The engine may cancel an image/script whose response type is unsuitable.
-                        sent += static_cast<size_t>(n);
-                    }
-                }
-                if (complete || length == 0 || it->data.size() > 32768 ||
-                    (length < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-                    close(it->fd);
-                    it = clients.erase(it);
-                } else ++it;
-            }
-            _sampled.store(sample);
-        }
-        for (const auto& client : clients) close(client.fd);
-    }
-};
+using neo_request_filter_probe::counts;
+using neo_request_filter_probe::loopback_server;
+using neo_request_filter_probe::no_request;
+using neo_request_filter_probe::since;
 
 struct completion {
     bool done{};

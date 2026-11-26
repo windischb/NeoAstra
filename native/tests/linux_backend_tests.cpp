@@ -394,6 +394,7 @@ void test_retained_closed_window_does_not_write_to_freed_backend_state(neoastra_
 
 struct releasing_resource {
     neoastra_view_t* view{};
+    neoastra_profile_t* profile{};
     neoastra_environment_t* environment{};
     unsigned requests{}, releases{}, failures{};
     bool finished{};
@@ -413,6 +414,7 @@ neoastra_result_t NEOASTRA_CALL resource_disposes_owners(void* context, const ne
     response->release = release_resource_response;
     response->release_context = resource;
     neoastra_view_release(std::exchange(resource->view, nullptr));
+    neoastra_profile_release(std::exchange(resource->profile, nullptr));
     neoastra_environment_release(std::exchange(resource->environment, nullptr));
     return NEOASTRA_OK;
 }
@@ -457,6 +459,54 @@ void test_resource_callback_can_release_its_view_and_environment(neoastra_app_t*
     assert(!resource.view && !resource.environment);
     assert(g_object_get_data(G_OBJECT(native), "neoastra.native-view") == nullptr);
     webkit_web_view_load_uri(native, "callback://neoastra/after-disposal");
+    wait_until([&] { return resource.failures != 0; });
+    assert(resource.requests == 1 && resource.releases == 1);
+    g_signal_handlers_disconnect_by_data(native, &resource);
+    g_object_unref(native);
+    neoastra_window_release(window);
+}
+
+// The same lifetime rule holds when a view of an ephemeral profile loads the custom scheme: the profile's own web
+// context owns that registration, and disposing the profile invalidates it before a retained widget reuses the context.
+void test_resource_callback_can_release_its_view_profile_and_environment(neoastra_app_t* app) {
+    releasing_resource resource;
+    const std::string name = "profilecallback";
+    neoastra_custom_scheme_t scheme{};
+    scheme.size = sizeof(scheme);
+    scheme.version = 1;
+    scheme.name = string_view(name);
+    scheme.flags = NEOASTRA_CUSTOM_SCHEME_HAS_AUTHORITY | NEOASTRA_CUSTOM_SCHEME_SECURE;
+    scheme.resource_provider = resource_disposes_owners;
+    scheme.resource_provider_context = &resource;
+    neoastra_environment_options_t options{};
+    options.size = sizeof(options);
+    options.version = 1;
+    options.private_mode = 1;
+    options.custom_scheme_count = 1;
+    options.custom_schemes = &scheme;
+    options.custom_scheme_stride = sizeof(scheme);
+    completion created;
+    assert(neoastra_environment_create_async(app, &options, environment_created, &created, nullptr, nullptr) == NEOASTRA_OK);
+    wait_for(created);
+    assert(created.result == NEOASTRA_OK && created.value);
+    resource.environment = static_cast<neoastra_environment_t*>(created.value);
+    resource.profile = create_profile(resource.environment, true);
+    auto* window = create_window(app);
+    resource.view = create_view(resource.environment, window, resource.profile);
+    auto* native = WEBKIT_WEB_VIEW(g_object_ref(web_view(resource.view)));
+    g_signal_connect(native, "load-changed", G_CALLBACK(+[](WebKitWebView*, WebKitLoadEvent event, void* context) {
+        if (event == WEBKIT_LOAD_FINISHED) static_cast<releasing_resource*>(context)->finished = true;
+    }), &resource);
+    g_signal_connect(native, "load-failed", G_CALLBACK(+[](WebKitWebView*, WebKitLoadEvent, const char*, GError*, void* context) -> gboolean {
+        ++static_cast<releasing_resource*>(context)->failures;
+        return TRUE;
+    }), &resource);
+    webkit_web_view_load_uri(native, "profilecallback://neoastra/first");
+    wait_until([&] { return resource.finished && resource.releases != 0; });
+    assert(resource.requests == 1 && resource.releases == 1 && resource.failures == 0);
+    assert(!resource.view && !resource.profile && !resource.environment);
+    // The widget keeps the profile's context alive, but its scheme registration no longer has an environment.
+    webkit_web_view_load_uri(native, "profilecallback://neoastra/after-disposal");
     wait_until([&] { return resource.failures != 0; });
     assert(resource.requests == 1 && resource.releases == 1);
     g_signal_handlers_disconnect_by_data(native, &resource);
@@ -926,6 +976,15 @@ WebKitNetworkSession* view_session(neoastra_environment_t* environment, neoastra
     return session;
 }
 
+// Returns the web context that a view of the environment runs in. The environment or the profile keeps it alive.
+WebKitWebContext* view_context(neoastra_environment_t* environment, neoastra_window_t* window, neoastra_profile_t* profile = nullptr) {
+    auto* view = create_view(environment, window, profile);
+    auto* context = webkit_web_view_get_context(web_view(view));
+    assert(context != nullptr);
+    neoastra_view_release(view);
+    return context;
+}
+
 std::string data_directory(WebKitNetworkSession* session) {
     const auto* value = webkit_website_data_manager_get_base_data_directory(webkit_network_session_get_website_data_manager(session));
     return value ? value : "";
@@ -992,6 +1051,7 @@ void test_user_data_roots(neoastra_app_t* app, const std::filesystem::path& base
     auto* second_profile = create_profile(second);
     auto* unrooted_profile = create_profile(unrooted);
     auto* ephemeral_profile = create_profile(first, true);
+    auto* second_ephemeral_profile = create_profile(first, true);
     auto* private_profile = create_profile(private_environment);
 
     auto* first_session = view_session(first, window);
@@ -1021,6 +1081,13 @@ void test_user_data_roots(neoastra_app_t* app, const std::filesystem::path& base
     assert(webkit_network_session_is_ephemeral(view_session(first, window, ephemeral_profile)));
     assert(view_session(private_environment, window, private_profile) == private_session);
 
+    // A profile that is not ephemeral shares the environment's web context; an ephemeral profile owns one of its own,
+    // so worker requests cannot cross the profile boundary through a shared context.
+    assert(view_context(first, window, first_profile) == view_context(first, window));
+    assert(view_context(private_environment, window, private_profile) == view_context(private_environment, window));
+    assert(view_context(first, window, ephemeral_profile) != view_context(first, window));
+    assert(view_context(first, window, second_ephemeral_profile) != view_context(first, window, ephemeral_profile));
+
     // What one root stores is visible through that root only, and clearing it leaves the other roots alone.
     set_cookie(first_profile, "first-root");
     set_cookie(second_profile, "second-root");
@@ -1035,6 +1102,7 @@ void test_user_data_roots(neoastra_app_t* app, const std::filesystem::path& base
     assert(!has_cookie(second_profile, "second-root"));
 
     neoastra_profile_release(private_profile);
+    neoastra_profile_release(second_ephemeral_profile);
     neoastra_profile_release(ephemeral_profile);
     neoastra_profile_release(unrooted_profile);
     neoastra_profile_release(second_profile);
@@ -1282,6 +1350,7 @@ int main() {
     test_retained_history_list_detaches_when_the_widget_dies_first(app);
     test_retained_closed_window_does_not_write_to_freed_backend_state(app);
     test_resource_callback_can_release_its_view_and_environment(app);
+    test_resource_callback_can_release_its_view_profile_and_environment(app);
     test_views_share_their_window(app);
     test_bounded_view_keeps_its_place(app);
     test_filling_view_goes_below_a_bounded_view(app);

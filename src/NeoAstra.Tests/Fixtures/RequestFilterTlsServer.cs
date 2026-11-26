@@ -24,14 +24,37 @@ internal sealed class RequestFilterTlsServer : IAsyncDisposable
     private int _handshakes;
     private int _requests;
 
-    internal RequestFilterTlsServer(string? frameDocument = null)
+    internal RequestFilterTlsServer(string? frameDocument = null) : this(frameDocument, null) { }
+
+    // An independently owned copy lets several loopback ports share one pinned
+    // certificate, including engines whose exception is keyed by host, not port.
+    internal RequestFilterTlsServer(string? frameDocument, X509Certificate2? certificate)
     {
-        using var key = RSA.Create(2048);
-        var request = new CertificateRequest("CN=NeoAstra disposable filter probe", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        var names = new SubjectAlternativeNameBuilder();
-        names.AddIpAddress(IPAddress.Loopback);
-        request.CertificateExtensions.Add(names.Build());
-        Certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddDays(1));
+        if (certificate is null)
+        {
+            using var key = RSA.Create(2048);
+            var request = new CertificateRequest("CN=NeoAstra disposable filter probe", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            var names = new SubjectAlternativeNameBuilder();
+            names.AddIpAddress(IPAddress.Loopback);
+            request.CertificateExtensions.Add(names.Build());
+            var created = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddDays(1));
+            if (OperatingSystem.IsWindows())
+            {
+                // SChannel cannot use CreateSelfSigned's ephemeral key as a server credential.
+                // Import once into a temporary key container (no PersistKeySet or trust-store
+                // change). Copies below share this usable key and must not re-export it.
+                using (created)
+                    Certificate = X509CertificateLoader.LoadPkcs12(created.Export(X509ContentType.Pkcs12), null);
+            }
+            else
+            {
+                Certificate = created;
+            }
+        }
+        else
+        {
+            Certificate = new X509Certificate2(certificate);
+        }
         _response = Response("<!doctype html><body>neoastra-tls-ready</body>");
         _frameResponse = frameDocument is null ? _response : Response(frameDocument);
         _listener.Start();

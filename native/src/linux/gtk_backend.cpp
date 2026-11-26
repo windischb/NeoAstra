@@ -1,6 +1,7 @@
 #include "../common/native_internal.hpp"
 #include "gtk_permissions.hpp"
 #include "gtk_renderer.hpp"
+#include "gtk_request_filter.hpp"
 
 #include <gtk/gtk.h>
 #include <webkit/webkit.h>
@@ -27,11 +28,11 @@ struct gtk_app { GMainContext* context{}; GMainLoop* loop{}; GSource* wake_sourc
 struct gtk_window { GtkWidget* widget{}; neoastra_window_state_t reported_state{NEOASTRA_WINDOW_NORMAL}; GdkSurface* surface{}; gulong laid_out{}; gulong entered_monitor{}; gulong left_monitor{}; };
 struct gtk_scheme_context { neoastra_environment_t* environment{}; };
 struct gtk_environment { WebKitWebContext* context{}; WebKitNetworkSession* session{}; gulong download_started{}; std::vector<gtk_scheme_context*> schemes; };
-struct gtk_profile { WebKitNetworkSession* session{}; gulong download_started{}; };
+struct gtk_profile { WebKitWebContext* context{}; WebKitNetworkSession* session{}; gulong download_started{}; std::vector<gtk_scheme_context*> schemes; };
 // A binding of an isolated world. WebKitGTK tells a handler neither its world nor its frame, so each binding has a handler name of
 // its own, registered in its world only, and its script runs in the top frame only.
 struct gtk_script_channel { neoastra_view_t* view{}; std::string world; std::string binding; std::string handler; gulong signal{}; };
-struct gtk_view { guint redraw_tick{}; bool redraw_resized{}; std::map<std::string,std::unique_ptr<gtk_script_channel>> channels; uint64_t next_channel{}; std::map<std::string,std::string> all_frame_worlds; GtkEventController* key_releases{}; std::vector<guint> claimed_keys; guint32 offered_key_time{}; guint offered_keycode{}; GtkWidget* widget{}; WebKitUserContentManager* content{}; WebKitBackForwardList* history_list{}; GtkDropTarget* drop_target{}; GtkEventController* keys{}; gulong load_changed{}; gulong load_failed{}; gulong title_changed{}; gulong uri_changed{}; gulong message_received{}; gulong process_terminated{}; gulong drop_received{}; gulong history_changed{}; uint64_t history{}; bool context_menus_disabled{}; bool default_script_dialogs{}; uint64_t next_script{1}; std::unordered_map<std::string,WebKitUserScript*> scripts; WebKitUserScript* bridge_relay{}; };
+struct gtk_view { std::shared_ptr<neo_gtk_filter::entry> filter_entry; bool shares_content_controller{}; guint redraw_tick{}; bool redraw_resized{}; std::map<std::string,std::unique_ptr<gtk_script_channel>> channels; uint64_t next_channel{}; std::map<std::string,std::string> all_frame_worlds; GtkEventController* key_releases{}; std::vector<guint> claimed_keys; guint32 offered_key_time{}; guint offered_keycode{}; GtkWidget* widget{}; WebKitUserContentManager* content{}; WebKitBackForwardList* history_list{}; GtkDropTarget* drop_target{}; GtkEventController* keys{}; gulong load_changed{}; gulong load_failed{}; gulong title_changed{}; gulong uri_changed{}; gulong message_received{}; gulong process_terminated{}; gulong drop_received{}; gulong history_changed{}; uint64_t history{}; bool context_menus_disabled{}; bool default_script_dialogs{}; uint64_t next_script{1}; std::unordered_map<std::string,WebKitUserScript*> scripts; WebKitUserScript* bridge_relay{}; };
 
 neoastra_error_t* make_error(neoastra_result_t code, const char* message, int64_t native_code = 0, const char* domain = "webkitgtk") noexcept { neoastra_error_t* error{}; neo_fail(&error, code, message, native_code, domain); return error; }
 
@@ -257,7 +258,7 @@ void uri_scheme_requested(WebKitURISchemeRequest* native_request,void* data) noe
     }
 }
 
-bool register_custom_schemes(neoastra_environment_t* environment,WebKitWebContext* context,neoastra_error_t** error) noexcept {
+bool register_custom_schemes(neoastra_environment_t* environment,WebKitWebContext* context,std::vector<gtk_scheme_context*>& registrations,neoastra_error_t** error) noexcept {
     if(!environment||!context)return false;
     for(const auto& scheme:environment->custom_schemes){
         if((scheme.flags&NEOASTRA_CUSTOM_SCHEME_SERVICE_WORKERS)!=0){
@@ -271,7 +272,7 @@ bool register_custom_schemes(neoastra_environment_t* environment,WebKitWebContex
         // invalidates its weak environment pointer on teardown instead of leaving a callback with freed userdata.
         auto registration=std::unique_ptr<gtk_scheme_context>(new(std::nothrow) gtk_scheme_context{environment});
         if(!registration){neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK scheme callback allocation failed");return false;}
-        try{static_cast<gtk_environment*>(environment->platform)->schemes.push_back(registration.get());}
+        try{registrations.push_back(registration.get());}
         catch(...){neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK scheme callback allocation failed");return false;}
         webkit_web_context_register_uri_scheme(context,scheme.name.c_str(),uri_scheme_requested,registration.release(),[](void* value){delete static_cast<gtk_scheme_context*>(value);});
         if((scheme.flags&NEOASTRA_CUSTOM_SCHEME_SECURE)!=0)webkit_security_manager_register_uri_scheme_as_secure(security,scheme.name.c_str());
@@ -418,7 +419,18 @@ void permission_decided(void* pointer,const neoastra_decision_response_t* respon
     g_object_unref(context->request);delete context;
 }
 struct new_window_context { neoastra_view_t* view{}; std::string uri; };
-void new_window_decided(void* pointer,const neoastra_decision_response_t* response) noexcept {std::unique_ptr<new_window_context> context(static_cast<new_window_context*>(pointer));auto* state=static_cast<gtk_view*>(context->view->platform);if(response->action==NEOASTRA_DECISION_ALLOW&&!response->target_view&&state&&state->widget)webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->widget),context->uri.c_str());}
+void new_window_decided(void* pointer,const neoastra_decision_response_t* response) noexcept {
+    std::unique_ptr<new_window_context> context(static_cast<new_window_context*>(pointer));
+    auto* state=static_cast<gtk_view*>(context->view->platform);
+    if(response->action!=NEOASTRA_DECISION_ALLOW||response->target_view||!state||!state->widget)return;
+    try {
+        // A deferred host answer must use the installed snapshot now, not the
+        // one from when window.open requested its same-view fallback.
+        const auto rules=std::atomic_load(&context->view->request_filter);
+        if(rules&&rules->refuses(context->uri,NEOASTRA_RESOURCE_DOCUMENT))return;
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(state->widget),context->uri.c_str());
+    } catch (...) { /* Never turn a failed filter check into an unfiltered fallback. */ }
+}
 void finish_synchronous_decision(neoastra_decision_t* decision);
 // The origin of the page that a view shows, or nothing for a page without one.
 std::string page_origin(WebKitWebView* web_view){
@@ -943,10 +955,10 @@ WebKitNetworkSession* persistent_session(neoastra_string_view_t user_data_root,n
 }
 }
 
-bool neo_platform_environment_create_async(neoastra_environment_t* environment,const neoastra_environment_options_t* options,neo_platform_created_callback_t callback,void* context,neoastra_error_t** error) noexcept {auto* state=new(std::nothrow) gtk_environment;if(!state)return false;state->context=webkit_web_context_new();state->session=options->private_mode?webkit_network_session_new_ephemeral():persistent_session(options->user_data_root,error);environment->platform=state;if(!state->context||!state->session){if(state->context)g_object_unref(state->context);if(state->session)g_object_unref(state->session);delete state;environment->platform=nullptr;if(error&&!*error)neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK could not create its web context or network session",0,"webkitgtk");return false;}if(!register_custom_schemes(environment,state->context,error)){neo_platform_environment_destroy(environment);return false;}state->download_started=g_signal_connect(state->session,"download-started",G_CALLBACK(download_started),nullptr);callback(context,nullptr);return true;}
+bool neo_platform_environment_create_async(neoastra_environment_t* environment,const neoastra_environment_options_t* options,neo_platform_created_callback_t callback,void* context,neoastra_error_t** error) noexcept {auto* state=new(std::nothrow) gtk_environment;if(!state)return false;state->context=webkit_web_context_new();state->session=options->private_mode?webkit_network_session_new_ephemeral():persistent_session(options->user_data_root,error);environment->platform=state;if(!state->context||!state->session){if(state->context)g_object_unref(state->context);if(state->session)g_object_unref(state->session);delete state;environment->platform=nullptr;if(error&&!*error)neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK could not create its web context or network session",0,"webkitgtk");return false;}if(!register_custom_schemes(environment,state->context,state->schemes,error)){neo_platform_environment_destroy(environment);return false;}state->download_started=g_signal_connect(state->session,"download-started",G_CALLBACK(download_started),nullptr);callback(context,nullptr);return true;}
 void neo_platform_environment_destroy(neoastra_environment_t* environment) noexcept {auto* state=static_cast<gtk_environment*>(environment->platform);if(!state)return;for(auto* registration:state->schemes)registration->environment=nullptr;if(state->session){if(state->download_started)g_signal_handler_disconnect(state->session,state->download_started);g_object_unref(state->session);}if(state->context)g_object_unref(state->context);delete state;environment->platform=nullptr;}
-bool neo_platform_profile_create(neoastra_profile_t* profile,neoastra_error_t** error) noexcept {auto* state=new(std::nothrow) gtk_profile;if(!state){neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK profile allocation failed");return false;}auto* environment=static_cast<gtk_environment*>(profile->environment->platform);state->session=profile->ephemeral?webkit_network_session_new_ephemeral():environment&&environment->session?WEBKIT_NETWORK_SESSION(g_object_ref(environment->session)):nullptr;if(!state->session){delete state;neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK profile network-session creation failed");return false;}if(profile->ephemeral)state->download_started=g_signal_connect(state->session,"download-started",G_CALLBACK(download_started),nullptr);profile->platform=state;return true;}
-void neo_platform_profile_destroy(neoastra_profile_t* profile) noexcept {auto* state=static_cast<gtk_profile*>(profile->platform);if(!state)return;if(state->session){if(state->download_started)g_signal_handler_disconnect(state->session,state->download_started);g_object_unref(state->session);}delete state;profile->platform=nullptr;}
+bool neo_platform_profile_create(neoastra_profile_t* profile,neoastra_error_t** error) noexcept {auto* state=new(std::nothrow) gtk_profile;if(!state){neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK profile allocation failed");return false;}auto* environment=static_cast<gtk_environment*>(profile->environment->platform);if(profile->ephemeral){/* An explicitly ephemeral profile gets its own web context, not only its own network session: WebKitGTK keeps web processes and workers per context, so a shared context would let worker requests cross profile boundaries. Custom schemes belong to that context and are invalidated with it. */state->context=webkit_web_context_new();state->session=webkit_network_session_new_ephemeral();}else state->session=environment&&environment->session?WEBKIT_NETWORK_SESSION(g_object_ref(environment->session)):nullptr;if(!state->session||(profile->ephemeral&&!state->context)){if(state->session)g_object_unref(state->session);if(state->context)g_object_unref(state->context);delete state;neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK profile network-session creation failed");return false;}if(profile->ephemeral&&!register_custom_schemes(profile->environment,state->context,state->schemes,error)){for(auto* registration:state->schemes)registration->environment=nullptr;if(state->session)g_object_unref(state->session);if(state->context)g_object_unref(state->context);delete state;return false;}if(profile->ephemeral)state->download_started=g_signal_connect(state->session,"download-started",G_CALLBACK(download_started),nullptr);profile->platform=state;return true;}
+void neo_platform_profile_destroy(neoastra_profile_t* profile) noexcept {auto* state=static_cast<gtk_profile*>(profile->platform);if(!state)return;for(auto* registration:state->schemes)registration->environment=nullptr;if(state->session){if(state->download_started)g_signal_handler_disconnect(state->session,state->download_started);g_object_unref(state->session);}if(state->context)g_object_unref(state->context);delete state;profile->platform=nullptr;}
 neoastra_result_t neo_platform_profile_get_cookies(neoastra_profile_t* profile,const std::string& uri,neoastra_buffer_callback_t callback,void* context,neoastra_operation_t* operation,neoastra_error_t** error) noexcept {auto* state=static_cast<gtk_profile*>(profile->platform);if(!state||!state->session)return neo_fail(error,NEOASTRA_ERROR_NOT_INITIALIZED,"WebKitGTK profile is not initialized");auto* completion=new(std::nothrow) cookie_context{callback,context,operation};if(!completion)return neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK cookie operation allocation failed");webkit_cookie_manager_get_cookies(webkit_network_session_get_cookie_manager(state->session),uri.c_str(),nullptr,cookies_finished,completion);return NEOASTRA_OK;}
 neoastra_result_t neo_platform_profile_set_cookie(neoastra_profile_t* profile,const neoastra_cookie_t* value,neoastra_completion_callback_t callback,void* context,neoastra_operation_t* operation,neoastra_error_t** error) noexcept {auto* state=static_cast<gtk_profile*>(profile->platform);if(!state||!state->session)return neo_fail(error,NEOASTRA_ERROR_NOT_INITIALIZED,"WebKitGTK profile is not initialized");auto* cookie=make_cookie(value);auto* completion=new(std::nothrow) cookie_change_context{callback,context,operation,false};if(!cookie||!completion){if(cookie)soup_cookie_free(cookie);delete completion;return neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK cookie allocation failed");}webkit_cookie_manager_add_cookie(webkit_network_session_get_cookie_manager(state->session),cookie,nullptr,cookie_changed,completion);soup_cookie_free(cookie);return NEOASTRA_OK;}
 neoastra_result_t neo_platform_profile_delete_cookie(neoastra_profile_t* profile,const neoastra_cookie_t* value,neoastra_completion_callback_t callback,void* context,neoastra_operation_t* operation,neoastra_error_t** error) noexcept {auto* state=static_cast<gtk_profile*>(profile->platform);if(!state||!state->session)return neo_fail(error,NEOASTRA_ERROR_NOT_INITIALIZED,"WebKitGTK profile is not initialized");auto* cookie=make_cookie(value);auto* completion=new(std::nothrow) cookie_change_context{callback,context,operation,true};if(!cookie||!completion){if(cookie)soup_cookie_free(cookie);delete completion;return neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK cookie allocation failed");}webkit_cookie_manager_delete_cookie(webkit_network_session_get_cookie_manager(state->session),cookie,nullptr,cookie_changed,completion);soup_cookie_free(cookie);return NEOASTRA_OK;}
@@ -1001,7 +1013,76 @@ gboolean devtools_key_pressed(GtkEventControllerKey* controller,guint keyval,gui
     webkit_web_inspector_show(webkit_web_view_get_inspector(web_view));return TRUE;
 }
 }
-bool neo_platform_view_create_async(neoastra_view_t* view,const neoastra_view_options_t* options,neo_platform_created_callback_t callback,void* context,neoastra_error_t** error) noexcept {if(view->bridge_policy==NEOASTRA_BRIDGE_TRUSTED_ORIGINS){neo_fail(error,NEOASTRA_ERROR_NOT_SUPPORTED,"WebKitGTK 6.0 does not expose trustworthy web-message sender origins",0,"webkitgtk");return false;}auto* environment=static_cast<gtk_environment*>(view->environment->platform);auto* profile=view->profile?static_cast<gtk_profile*>(view->profile->platform):nullptr;auto* web_context=environment?environment->context:nullptr;auto* session=profile?profile->session:environment?environment->session:nullptr;auto* parent=view_parent(view);if(!web_context||!session||!parent){neo_fail(error,NEOASTRA_ERROR_INVALID_STATE,"WebKitGTK context, network session, or parent is unavailable");return false;}auto* state=new(std::nothrow) gtk_view;if(!state)return false;state->content=webkit_user_content_manager_new();if(!state->content){delete state;neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK could not allocate its user-content manager",0,"webkitgtk");return false;}if(view->bridge_policy!=NEOASTRA_BRIDGE_DISABLED){state->bridge_relay=webkit_user_script_new_for_world(bridge_relay_source,WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,bridge_world,nullptr,nullptr);if(!state->bridge_relay||!webkit_user_content_manager_register_script_message_handler(state->content,"_neoastra_transport_v1",bridge_world)){if(state->bridge_relay)webkit_user_script_unref(state->bridge_relay);g_object_unref(state->content);delete state;neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK could not register the private transport handler",0,"webkitgtk");return false;}webkit_user_content_manager_add_script(state->content,state->bridge_relay);}WebKitWebView* related{};if(options->popup_request&&options->popup_request->owner){auto* opener=static_cast<gtk_view*>(options->popup_request->owner->platform);if(opener&&opener->widget)related=WEBKIT_WEB_VIEW(opener->widget);}state->widget=related?GTK_WIDGET(g_object_new(WEBKIT_TYPE_WEB_VIEW,"related-view",related,"user-content-manager",state->content,nullptr)):GTK_WIDGET(g_object_new(WEBKIT_TYPE_WEB_VIEW,"web-context",web_context,"network-session",session,"user-content-manager",state->content,nullptr));view->platform=state;
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t*) noexcept {
+    return NEOASTRA_REQUEST_FILTER_SUBRESOURCES | NEOASTRA_REQUEST_FILTER_FRAMES | NEOASTRA_REQUEST_FILTER_PER_VIEW;
+}
+
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t* view, const neo_request_filter::filter& rules,
+    neo_request_filter_prepared_callback_t callback, void* context, neoastra_error_t** error) noexcept {
+    return neo_gtk_filter::prepare<gtk_view>(view, rules, callback, context, error);
+}
+
+bool neo_platform_view_create_async(neoastra_view_t* view,const neoastra_view_options_t* options,neo_platform_created_callback_t callback,void* context,neoastra_error_t** error) noexcept {
+    if(view->bridge_policy==NEOASTRA_BRIDGE_TRUSTED_ORIGINS){
+        neo_fail(error,NEOASTRA_ERROR_NOT_SUPPORTED,"WebKitGTK 6.0 does not expose trustworthy web-message sender origins",0,"webkitgtk");
+        return false;
+    }
+    auto* environment=static_cast<gtk_environment*>(view->environment->platform);
+    auto* profile=view->profile?static_cast<gtk_profile*>(view->profile->platform):nullptr;
+    // An explicitly ephemeral profile owns a web context of its own: WebKitGTK keeps web processes and workers per context, so a shared context would let worker requests cross profile boundaries. Other profiles and profile-less views keep the environment's context.
+    auto* web_context=profile&&profile->context?profile->context:environment?environment->context:nullptr;
+    auto* session=profile?profile->session:environment?environment->session:nullptr;
+    auto* parent=view_parent(view);
+    if(!web_context||!session||!parent){
+        neo_fail(error,NEOASTRA_ERROR_INVALID_STATE,"WebKitGTK context, network session, or parent is unavailable");
+        return false;
+    }
+    auto* state=new(std::nothrow) gtk_view;
+    if(!state)return false;
+    // During create, WebKitGTK reuses configurationForNextRelatedView instead
+    // of honoring the new view's user-content-manager for its engine page.
+    // Until GTK exposes an independent popup controller, keep existing unfiltered
+    // popups working but refuse the combination with installed or pending filters.
+    if(options->popup_request){
+        const auto rules=std::atomic_load(&view->request_filter);
+        auto* opener=options->popup_request->owner;
+        const auto inherited=opener?std::atomic_load(&opener->request_filter):nullptr;
+        if((rules&&!rules->empty())||(inherited&&!inherited->empty())||(opener&&!opener->request_filter_queue.empty())){
+            delete state;
+            neo_fail(error,NEOASTRA_ERROR_NOT_SUPPORTED,"Tracked popups cannot have independent request filters in WebKitGTK");
+            return false;
+        }
+        state->shares_content_controller=true;
+    }
+    state->content=webkit_user_content_manager_new();
+    if(!state->content){
+        delete state;
+        neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK could not allocate its user-content manager",0,"webkitgtk");
+        return false;
+    }
+    if(view->bridge_policy!=NEOASTRA_BRIDGE_DISABLED){
+        state->bridge_relay=webkit_user_script_new_for_world(bridge_relay_source,WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,bridge_world,nullptr,nullptr);
+        if(!state->bridge_relay||!webkit_user_content_manager_register_script_message_handler(state->content,"_neoastra_transport_v1",bridge_world)){
+            if(state->bridge_relay)webkit_user_script_unref(state->bridge_relay);
+            g_object_unref(state->content);delete state;
+            neo_fail(error,NEOASTRA_ERROR_NATIVE_FAILURE,"WebKitGTK could not register the private transport handler",0,"webkitgtk");
+            return false;
+        }
+        webkit_user_content_manager_add_script(state->content,state->bridge_relay);
+    }
+    WebKitWebView* related{};
+    if(options->popup_request&&options->popup_request->owner){
+        auto* opener=static_cast<gtk_view*>(options->popup_request->owner->platform);
+        if(opener&&opener->widget){
+            related=WEBKIT_WEB_VIEW(opener->widget);
+            // Do not lift this restriction when the logical popup is disposed:
+            // native handles and engine pages may outlive that client handle.
+            opener->shares_content_controller=true;
+        }
+    }
+    state->widget=related?GTK_WIDGET(g_object_new(WEBKIT_TYPE_WEB_VIEW,"related-view",related,"user-content-manager",state->content,nullptr)):
+        GTK_WIDGET(g_object_new(WEBKIT_TYPE_WEB_VIEW,"web-context",web_context,"network-session",session,"user-content-manager",state->content,nullptr));
+    view->platform=state;
     // WebKitGTK before 2.46 gives a page no microphone or camera to ask for unless the setting is on. A page asks as it does in
     // the other backends whatever the version, and its request is refused unless the host allows it.
     webkit_settings_set_enable_media_stream(webkit_web_view_get_settings(WEBKIT_WEB_VIEW(state->widget)),TRUE);

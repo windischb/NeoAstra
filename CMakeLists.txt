@@ -74,7 +74,8 @@ if(WIN32)
   list(APPEND neoastra_common_libraries ws2_32)
 endif()
 add_library(neoastra_native ${_neo_library_type} ${neoastra_common_sources})
-if(NOT APPLE AND NOT ANDROID)
+# Backends without their own request filter report no coverage and refuse nonempty filters.
+if(WIN32)
   target_sources(neoastra_native PRIVATE native/src/common/request_filter_unsupported.cpp)
 endif()
 target_compile_definitions(neoastra_native PRIVATE NEOASTRA_BUILD=1)
@@ -323,6 +324,23 @@ if(NEOASTRA_BUILD_TESTS)
     set_tests_properties(neoastra_macos_request_filter_probe_baseline PROPERTIES TIMEOUT 120)
     set_tests_properties(neoastra_macos_request_filter_api_tests PROPERTIES TIMEOUT 120)
   elseif(UNIX)
+    add_executable(neoastra_linux_request_filter_tests
+      native/tests/linux_request_filter_tests.cpp native/src/common/request_filter.cpp)
+    target_include_directories(neoastra_linux_request_filter_tests PRIVATE native/src/common)
+    target_link_libraries(neoastra_linux_request_filter_tests PRIVATE
+      neoastra_native neoastra_sanitizers PkgConfig::GTK PkgConfig::WEBKIT Threads::Threads ${CMAKE_DL_LIBS})
+    # Only this test executable interposes the compiler input. The product has
+    # no fault-injection switch; WebKit still produces the real async GError.
+    target_link_options(neoastra_linux_request_filter_tests PRIVATE
+      "-Wl,--export-dynamic-symbol=webkit_user_content_filter_store_save")
+    add_test(NAME neoastra_linux_request_filter_engine COMMAND neoastra_linux_request_filter_tests --engine)
+    add_test(NAME neoastra_linux_request_filter_api COMMAND neoastra_linux_request_filter_tests --api)
+    add_test(NAME neoastra_linux_request_filter_compile_errors COMMAND neoastra_linux_request_filter_tests --compile-errors)
+    add_test(NAME neoastra_linux_request_filter_matrix COMMAND neoastra_linux_request_filter_tests --matrix)
+    add_test(NAME neoastra_linux_request_filter_addressing COMMAND neoastra_linux_request_filter_tests --addressing)
+    set_tests_properties(neoastra_linux_request_filter_engine neoastra_linux_request_filter_api
+      neoastra_linux_request_filter_compile_errors neoastra_linux_request_filter_matrix neoastra_linux_request_filter_addressing
+      PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
     add_executable(neoastra_linux_backend_tests native/tests/linux_backend_tests.cpp)
     target_link_libraries(neoastra_linux_backend_tests PRIVATE
       neoastra_native neoastra_sanitizers PkgConfig::GTK PkgConfig::WEBKIT)
