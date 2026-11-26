@@ -26,24 +26,44 @@ SAFE_OUTCOMES = {
 GUARD = re.compile(r"if \(!owner \|\| view->ui_destroyed\.load\(std::memory_order_acquire\)\)\s*(\{[^}]*\}|return S_OK;)")
 
 
+# Functions whose handlers belong to no view (a popup sink, a view being retired): they hold no view to guard.
+NON_VIEW_FUNCTIONS = ("HRESULT lock_popup_sink(", "bool retire_filtered_view(")
+
+
+def non_view_spans(backend: str) -> list[tuple[int, int]]:
+    spans = []
+    for signature in NON_VIEW_FUNCTIONS:
+        start = backend.find("\n" + signature)
+        assert start != -1, f"{signature} not found"
+        end = backend.find("\n}\n", start)
+        spans.append((start, end))
+    return spans
+
+
 class WindowsHandlerGuardTests(unittest.TestCase):
     def test_released_view_guards_apply_neoastra_safe_outcome(self) -> None:
         backend = (ROOT / "native/src/windows/windows_backend.cpp").read_text(encoding="utf-8")
+        spans = non_view_spans(backend)
         for event, outcomes in SAFE_OUTCOMES.items():
             with self.subTest(event=event):
+                registrations = []
                 registration = backend.find(f"->add_{event}(")
-                self.assertNotEqual(-1, registration, f"add_{event} registration not found")
-                guard = GUARD.search(backend, registration)
-                self.assertIsNotNone(guard, f"add_{event} has no released-view guard")
-                assert guard is not None
-                next_registration = backend.find("->add_", registration + 1)
-                self.assertTrue(next_registration == -1 or guard.start() < next_registration,
-                                f"the first released-view guard after add_{event} belongs to another handler")
-                body = guard.group(1)
-                for outcome in outcomes:
-                    self.assertIn(outcome, body, f"add_{event} returns without {outcome} for a released view")
-                self.assertIn("return S_OK;", body)
-
+                while registration != -1:
+                    if not any(start < registration < end for start, end in spans):
+                        registrations.append(registration)
+                    registration = backend.find(f"->add_{event}(", registration + 1)
+                self.assertTrue(registrations, f"add_{event} registration of a view not found")
+                for registration in registrations:
+                    guard = GUARD.search(backend, registration)
+                    self.assertIsNotNone(guard, f"add_{event} has no released-view guard")
+                    assert guard is not None
+                    next_registration = backend.find("->add_", registration + 1)
+                    self.assertTrue(next_registration == -1 or guard.start() < next_registration,
+                                    f"the first released-view guard after add_{event} belongs to another handler")
+                    body = guard.group(1)
+                    for outcome in outcomes:
+                        self.assertIn(outcome, body, f"add_{event} returns without {outcome} for a released view")
+                    self.assertIn("return S_OK;", body)
 
 if __name__ == "__main__":
     unittest.main()

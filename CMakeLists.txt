@@ -74,10 +74,6 @@ if(WIN32)
   list(APPEND neoastra_common_libraries ws2_32)
 endif()
 add_library(neoastra_native ${_neo_library_type} ${neoastra_common_sources})
-# Backends without their own request filter report no coverage and refuse nonempty filters.
-if(WIN32)
-  target_sources(neoastra_native PRIVATE native/src/common/request_filter_unsupported.cpp)
-endif()
 target_compile_definitions(neoastra_native PRIVATE NEOASTRA_BUILD=1)
 target_include_directories(neoastra_native PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
@@ -263,6 +259,40 @@ if(NEOASTRA_BUILD_TESTS)
     target_include_directories(neoastra_windows_callback_tests PRIVATE native/include native/src/common)
     target_link_libraries(neoastra_windows_callback_tests PRIVATE neoastra_native neoastra_sanitizers user32 gdi32)
     add_test(NAME neoastra_windows_callback_tests COMMAND neoastra_windows_callback_tests)
+    # The request-filter tests use hidden windows that are never shown or activated, and loopback servers of their own.
+    # The test-hooks library is the real backend with deterministic fault injection (NEOASTRA_WINDOWS_TEST_HOOKS).
+    add_library(neoastra_native_test_hooks SHARED ${neoastra_common_sources} native/src/windows/windows_backend.cpp)
+    target_compile_definitions(neoastra_native_test_hooks PRIVATE NEOASTRA_BUILD=1 NEOASTRA_WINDOWS_TEST_HOOKS=1)
+    target_include_directories(neoastra_native_test_hooks PUBLIC native/include PRIVATE "${webview2_sdk_SOURCE_DIR}/build/native/include")
+    target_compile_options(neoastra_native_test_hooks PRIVATE /W4 /permissive- /EHsc /utf-8 /Z7)
+    target_link_options(neoastra_native_test_hooks PRIVATE /DEBUG)
+    target_link_libraries(neoastra_native_test_hooks PRIVATE ${neoastra_common_libraries}
+      user32 gdi32 ole32 shell32 shcore shlwapi dwmapi "${webview2_sdk_SOURCE_DIR}/build/native/${_webview2_arch}/WebView2LoaderStatic.lib")
+    # Without ICoreWebView2_22 (simulated through the test hooks): capability NONE, nonempty filters fail closed.
+    add_executable(neoastra_windows_request_filter_unsupported_tests native/tests/windows_request_filter_unsupported_tests.cpp)
+    target_include_directories(neoastra_windows_request_filter_unsupported_tests PRIVATE native/include)
+    target_link_libraries(neoastra_windows_request_filter_unsupported_tests PRIVATE neoastra_native_test_hooks neoastra_sanitizers ws2_32 user32)
+    add_test(NAME neoastra_windows_request_filter_unsupported_tests COMMAND neoastra_windows_request_filter_unsupported_tests)
+    set_tests_properties(neoastra_windows_request_filter_unsupported_tests PROPERTIES TIMEOUT 120)
+    # The real library on the installed runtime: filtering, popups, isolation, lifetime.
+    add_executable(neoastra_windows_request_filter_tests native/tests/windows_request_filter_tests.cpp)
+    target_compile_options(neoastra_windows_request_filter_tests PRIVATE /Z7)
+    target_link_options(neoastra_windows_request_filter_tests PRIVATE /DEBUG)
+    target_include_directories(neoastra_windows_request_filter_tests PRIVATE native/include native/src/common)
+    target_link_libraries(neoastra_windows_request_filter_tests PRIVATE neoastra_native neoastra_sanitizers ws2_32 user32 dbghelp)
+    add_test(NAME neoastra_windows_request_filter_tests COMMAND neoastra_windows_request_filter_tests)
+    # Label browser: real network traffic through the installed WebView2 runtime, minutes long. The ordinary ctest run of
+    # eng/build_native.py leaves them out; `--browser-tests` runs only them (a job of their own in .github/workflows/native.yml).
+    set_tests_properties(neoastra_windows_request_filter_tests PROPERTIES TIMEOUT 600 LABELS browser)
+    # Fault injection: refusal fallbacks, preparation, popup sinks, their limit and allocation failures.
+    add_executable(neoastra_windows_request_filter_failure_tests native/tests/windows_request_filter_tests.cpp)
+    target_compile_options(neoastra_windows_request_filter_failure_tests PRIVATE /Z7)
+    target_link_options(neoastra_windows_request_filter_failure_tests PRIVATE /DEBUG)
+    target_compile_definitions(neoastra_windows_request_filter_failure_tests PRIVATE NEOASTRA_FAILURE_ONLY=1)
+    target_include_directories(neoastra_windows_request_filter_failure_tests PRIVATE native/include native/src/common)
+    target_link_libraries(neoastra_windows_request_filter_failure_tests PRIVATE neoastra_native_test_hooks neoastra_sanitizers ws2_32 user32 dbghelp)
+    add_test(NAME neoastra_windows_request_filter_failure_tests COMMAND neoastra_windows_request_filter_failure_tests)
+    set_tests_properties(neoastra_windows_request_filter_failure_tests PROPERTIES TIMEOUT 600 LABELS browser)
   elseif(APPLE)
     add_executable(neoastra_macos_lifetime_tests native/tests/macos_lifetime_tests.mm)
     target_compile_options(neoastra_macos_lifetime_tests PRIVATE -fobjc-arc)

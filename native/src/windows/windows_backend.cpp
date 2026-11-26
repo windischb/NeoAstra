@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,7 +36,25 @@ namespace {
 constexpr UINT dispatch_message = WM_APP + 0x4e;
 constexpr UINT quit_message = WM_APP + 0x4f;
 constexpr UINT destroy_app_message = WM_APP + 0x50;
-// Decision timers use the address of their decision as identifier, which is never 1 or 2.
+// A popup sink whose canceled navigation completed: it is closed outside the controller's own event (see windows_popup_sink).
+constexpr UINT sink_close_message = WM_APP + 0x51;
+// Popup sinks are resources, not a barrier: each lives until its first navigation completed, at most this long.
+constexpr UINT popup_sink_lifetime_ms = 10000;
+// A retiring view is closed this long after its about:blank navigation completed, and at the latest after
+// retiring_view_lifetime_ms, also when its document never finished unloading.
+constexpr UINT retiring_view_grace_ms = 1000;
+constexpr UINT retiring_view_lifetime_ms = 3000;
+// Popup sinks alive or being created per opener view. Beyond it a window request is not contained (see contain_popup).
+constexpr unsigned maximum_popup_sinks = 16;
+// Popup sinks alive or being created in one application, of all its views, including those of views already destroyed.
+constexpr unsigned maximum_popup_sinks_of_app = 64;
+// A popup sink whose controller was not created within this time fails its request closed (see close_listed_popup_sink).
+constexpr UINT popup_sink_creation_ms = 10000;
+// Retiring views at once (see windows_retiring_view). Beyond it a filtered view closes at once; it is offline already.
+constexpr unsigned maximum_retiring_views = 16;
+// Decision timers use the (aligned, even) address of their decision as identifier. Popup sinks and retiring views use odd
+// identifiers from windows_app::next_timer_id, never reused: a WM_TIMER or close message that outlived its sink or view
+// matches nothing, and no identifier of one kind can be taken for the other. Neither is ever 1 or 2.
 constexpr UINT_PTR dispatch_timer = 1;
 constexpr UINT_PTR display_timer = 2;
 constexpr wchar_t dispatch_class[] = L"NeoAstra.Dispatcher";
@@ -43,7 +62,19 @@ constexpr wchar_t window_class[] = L"NeoAstra.Window";
 
 // `dispatch_armed` is true while a dispatch message or the dispatch timer waits: that one wake-up stands for all queued
 // work. `dispatch_deferred`, on the UI thread only, turns a dispatch message that waits into the timer when it arrives.
+struct windows_popup_sink;
+struct windows_retiring_view;
 struct windows_app {
+    // The popup sinks of this application, alive or being created (see windows_popup_sink).
+    windows_popup_sink* sinks{};
+    // The filtered views being destroyed whose document is still unloading (see windows_retiring_view).
+    windows_retiring_view* retiring{};
+    bool retiring_limit_logged{};
+    // Controller creations of popup sinks that were closed before their controller came (their creation timed out, their
+    // opener went away): they still count against maximum_popup_sinks_of_app until WebView2 completes them. Shared with
+    // those completions, which may come after the application state is gone.
+    std::shared_ptr<unsigned> orphaned_sink_creations{std::make_shared<unsigned>(0u)};
+    UINT_PTR next_timer_id{3}; // odd, see dispatch_timer
     HWND dispatcher{}; bool owns_com{}; std::atomic<bool> dispatch_armed{false}; bool dispatch_deferred{}; std::vector<neoastra_decision_t*> decision_timers;
     // The virtual desktops of the shell, created on first use; absent where the shell has none (Windows Server, no Explorer).
     ComPtr<IVirtualDesktopManager> desktops;
@@ -83,7 +114,13 @@ struct windows_window {
         if (executable_small_icon) DestroyIcon(executable_small_icon);
     }
 };
-struct windows_environment { ComPtr<ICoreWebView2Environment> value; std::string version; bool private_mode{}; };
+struct windows_environment {
+    ComPtr<ICoreWebView2Environment> value;
+    std::string version;
+    bool private_mode{};
+    // Whether this runtime is expected to offer ICoreWebView2_22. The query on a created view stays authoritative and clears it.
+    std::atomic<bool> request_filter_ready{};
+};
 struct windows_profile { ComPtr<ICoreWebView2CookieManager> cookies; ComPtr<ICoreWebView2Profile> profile; };
 struct windows_drop_registration { HWND window{}; ComPtr<IDropTarget> target; };
 // A script of an isolated world, which WebView2 offers only through the DevTools protocol.
@@ -94,6 +131,89 @@ struct windows_world_script {
     std::string devtools_identifier;
 };
 struct windows_script_context { std::string world; std::string frame; std::string origin; };
+
+// What refusing a request needs apart from its view. The WebResourceRequested handler reaches its view only through this
+// gate: it outlives the closing of the controller (see close_gate_controller), and a gate without a view refuses every
+// request (a view being destroyed, or a popup sink).
+struct windows_request_gate {
+    neoastra_view_t* view{};                     // UI thread; null once the view is destroyed, and for a popup sink
+    neoastra_app_t* app{};                       // outlives the gate: application shutdown closes every popup sink first
+    ComPtr<ICoreWebView2Environment> environment;
+    // Prepared with the first nonempty filter, so that refusing needs no allocation when a fresh response cannot be made.
+    ComPtr<ICoreWebView2WebResourceResponse> denial_response;
+    EventRegistrationToken resource_token{};
+    bool resource_registered{};
+    // The DevTools Network domain of the view (see enable_network_domain): its commands may be processed out of order, so the
+    // offline switch waits for its confirmation (offline_queued) and reports "fail-closed" only once it is confirmed.
+    enum class network_domain : unsigned char { off, pending, enabled, failed };
+    network_domain network{network_domain::off};
+    bool offline_queued{};
+    unsigned char offline_report{}; // the cut_off_report of the queued switch (the strongest one asked for)
+    unsigned refusal_fallbacks_logged{}; // the fallbacks of refuse_request already logged for this gate, one bit each
+};
+
+// The window of a popup that a FILTERED view must not open. After a NewWindowRequested event that is handled without a new
+// window, WebView2 does not offer every request of the opener to WebResourceRequested (measured on runtime 158: up to 9 of
+// 18 requests overlapping the window requests reached a refused port, and with a deferred answer 5 of 8 kinds of later
+// requests too); giving the event a real WebView through put_NewWindow kept all of them offered and refused in the same
+// measurement. So such a window request is answered with this hidden, locked-down WebView: it is
+// never shown, runs no script, cancels every navigation, denies permissions and downloads, refuses every request, and is
+// closed after its first navigation completed (at the latest popup_sink_lifetime_ms after its assignment, or at application
+// shutdown). Its creation is bounded too (popup_sink_creation_ms), and so is their number, per view and per application.
+struct windows_popup_sink {
+    neoastra_app_t* app{};
+    UINT_PTR id{}; // its timer and close-message identifier (see dispatch_timer)
+    // The view whose window request this sink answers (UI thread, weak; null once that view is destroyed): its disposal must
+    // complete a request this sink still holds before the opener's controller closes, because the event and its deferral
+    // belong to that view (see close_popup_sinks_of_view).
+    neoastra_view_t* opener{};
+    ComPtr<ICoreWebView2Controller> controller;
+    ComPtr<ICoreWebView2> core;
+    std::shared_ptr<windows_request_gate> gate; // without a view: refuses every request
+    // The window request being answered, until the deferral is completed.
+    ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args;
+    ComPtr<ICoreWebView2Deferral> deferral;
+    std::function<void()> after; // run after the deferral was completed (the fallback navigation of an allowed request)
+    // The handlers that lock_popup_sink registered, which capture this sink. They are removed before it is freed, so that
+    // no engine callback can reach a freed sink after the controller was closed.
+    EventRegistrationToken navigation_starting{}, frame_navigation_starting{}, new_window{}, permission{}, download{}, navigation_completed{};
+    // Shared with the completion of the controller's creation, which may come after the sink was closed and freed (at the
+    // latest at shutdown): it then finds no sink and only closes the controller.
+    std::shared_ptr<windows_popup_sink*> slot;
+    bool creation_pending{}; // its controller creation was started and has not completed yet
+    windows_popup_sink* next{};
+};
+
+// A FILTERED view being destroyed. Close() alone lets requests that are in flight, such as the beacons and keepalive
+// requests of pagehide, reach their destination without being offered to the handler (see close_gate_controller). So the
+// controller first unloads its document through about:blank, while the handler, whose gate no longer has a view, refuses
+// every request; it is closed retiring_view_grace_ms after that navigation completed, at the latest after
+// retiring_view_lifetime_ms, or at application shutdown. Measured on runtime 158: Close() alone let 2 to 8 requests through
+// in 4 of 5 rounds; closing right after starting the navigation still did in 3 of 5. Closing as soon as the navigation
+// completed let none through in 18 of 18 rounds of a plain view, but with the Network domain enabled and the controller
+// moved to a hidden window, as here, the pagehide requests still got through in 1 of 10 rounds (in 2 to 4 of 6 rounds of
+// the acceptance suite); waiting 500 ms after the completion let none through in 10 of 10. The view was cut off from the
+// network before (see neo_platform_view_destroy), so a request that is not offered to the handler fails too.
+struct windows_retiring_view {
+    neoastra_app_t* app{};
+    UINT_PTR id{}; // its timer identifier (see dispatch_timer)
+    ComPtr<ICoreWebView2Controller> controller;
+    ComPtr<ICoreWebView2> core;
+    std::shared_ptr<windows_request_gate> gate; // without a view: refuses every request
+    EventRegistrationToken navigation_starting{}, navigation_completed{}, new_window{};
+    // Only the completion of the about:blank navigation arms the grace period, once, and never past the deadline.
+    ULONGLONG deadline{};
+    UINT64 navigation_id{};
+    bool navigation_known{};
+    bool grace_armed{};
+    windows_retiring_view* next{};
+};
+
+UINT_PTR take_timer_id(windows_app* app_state) noexcept {
+    const auto id = app_state->next_timer_id;
+    app_state->next_timer_id += 2;
+    return id;
+}
 
 struct windows_view {
     std::unordered_map<std::string, windows_world_script> world_scripts;
@@ -122,7 +242,10 @@ struct windows_view {
     EventRegistrationToken history_changed{};
     EventRegistrationToken message_received{};
     bool message_registered{};
-    EventRegistrationToken web_resource_requested{};
+    // Owned with the WebResourceRequested handler, which holds it too.
+    std::shared_ptr<windows_request_gate> gate;
+    // The one broad ICoreWebView2_22 registration of this view; rules live in view->request_filter, not in the engine.
+    bool request_filter_hook{};
     EventRegistrationToken permission_requested{};
     EventRegistrationToken new_window_requested{};
     EventRegistrationToken process_failed{};
@@ -541,6 +664,316 @@ HRESULT create_resource_response(neoastra_view_t* view, const neoastra_resource_
     } catch (...) { return E_FAIL; }
 }
 
+// ---- Request filter: defense in depth, not a sandbox. The common layer publishes view->request_filter after local
+// installation. The engine gets one stable broad registration per view (every request of DOCUMENT sources, never workers),
+// and every decision reads the current snapshot, so replacing rules needs no engine round trip and promises no global barrier.
+constexpr uint64_t windows_request_filter_flags =
+    NEOASTRA_REQUEST_FILTER_SUBRESOURCES | NEOASTRA_REQUEST_FILTER_FRAMES | NEOASTRA_REQUEST_FILTER_PER_VIEW;
+
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+// Test builds only: simulates a runtime without ICoreWebView2_22 deterministically.
+bool test_request_filter_unavailable() noexcept {
+    char value[8]{};
+    return GetEnvironmentVariableA("NEOASTRA_TEST_NO_REQUEST_FILTER_22", value, sizeof(value)) != 0;
+}
+
+// Test builds only: NEOASTRA_TEST_RF_FAIL="point=count,..." fails the next `count` (or `all`) attempts at a point: "create",
+// "assign", "prepared", "assign_prepared", "neutralize" (the refusal), "prepare" (installation), "new_window" (popup setup),
+// "sink" (creating a popup sink), "popup_hook" (registering a tracked popup's filter after its assignment).
+// "cut_off" (cutting a view off from the network), "cut_off_async" (its completion reports a failure), "sink_never" (a popup
+// sink whose controller creation never completes). NEOASTRA_TEST_SINK_CREATION_MS overrides popup_sink_creation_ms.
+// NEOASTRA_TEST_SINK_CAP and NEOASTRA_TEST_SINK_APP_CAP override the limits of popup sinks per view and per application.
+// Re-read whenever the variable changes.
+bool test_inject_failure(const char* point) noexcept {
+    static std::mutex lock;
+    static std::string last;
+    static std::unordered_map<std::string, int> remaining;
+    char buffer[160]{};
+    const auto length = GetEnvironmentVariableA("NEOASTRA_TEST_RF_FAIL", buffer, sizeof(buffer));
+    try {
+        std::lock_guard guard(lock);
+        const std::string current = length > 0 && length < sizeof(buffer) ? buffer : "";
+        if (current != last) {
+            last = current;
+            remaining.clear();
+            size_t at = 0;
+            while (at < current.size()) {
+                const auto end = std::min(current.find(',', at), current.size());
+                const auto item = current.substr(at, end - at);
+                const auto eq = item.find('=');
+                if (eq != std::string::npos) {
+                    const auto value = item.substr(eq + 1);
+                    remaining[item.substr(0, eq)] = value == "all" ? -1 : std::atoi(value.c_str());
+                }
+                at = end + 1;
+            }
+        }
+        const auto found = remaining.find(point);
+        if (found == remaining.end() || found->second == 0) return false;
+        if (found->second > 0) --found->second;
+        return true;
+    } catch (...) { return false; }
+}
+// Test builds only: NEOASTRA_TEST_SINK_HOLD keeps a popup sink after its first navigation, so that only its timer closes it;
+// NEOASTRA_TEST_SINK_LIFETIME_MS overrides popup_sink_lifetime_ms.
+bool test_hold_popup_sinks() noexcept { return GetEnvironmentVariableA("NEOASTRA_TEST_SINK_HOLD", nullptr, 0) != 0; }
+UINT popup_sink_lifetime() noexcept {
+    char value[16]{};
+    if (GetEnvironmentVariableA("NEOASTRA_TEST_SINK_LIFETIME_MS", value, sizeof(value))) return static_cast<UINT>(std::atoi(value));
+    return popup_sink_lifetime_ms;
+}
+#else
+constexpr bool test_inject_failure(const char*) noexcept { return false; }
+constexpr bool test_hold_popup_sinks() noexcept { return false; }
+constexpr UINT popup_sink_lifetime() noexcept { return popup_sink_lifetime_ms; }
+#endif
+
+// Who is told about the offline switch of cut_off_from_network: nobody; the host, as for an uncontained window request
+// ("Request filter fail-closed" once confirmed, "Request filter degraded" otherwise); or, for a view being destroyed, a
+// warning when it fails.
+enum class cut_off_report : unsigned char { none, popup, teardown };
+
+void report_offline_result(windows_request_gate& gate, cut_off_report report, HRESULT result) noexcept {
+    if (!gate.app || report == cut_off_report::none) return;
+    const bool cut_off = SUCCEEDED(result) && gate.network == windows_request_gate::network_domain::enabled;
+    if (report == cut_off_report::teardown) {
+        if (!cut_off)
+            neo_log(gate.app, NEOASTRA_LOG_WARNING, "request_filter",
+                    "A filtered view being destroyed could not be cut off from the network; requests that are not offered to the filter while it goes away may reach their destination",
+                    FAILED(result) ? result : E_FAIL);
+        return;
+    }
+    if (!gate.view) return; // destroyed meanwhile: nothing is left to filter
+    if (cut_off)
+        neo_log(gate.app, NEOASTRA_LOG_ERROR, "request_filter",
+                "Request filter fail-closed: a window request of a filtered view could not be contained; the view is cut off from the network until it is destroyed", S_OK);
+    else
+        neo_log(gate.app, NEOASTRA_LOG_ERROR, "request_filter",
+                "Request filter degraded: a window request of a filtered view could not be contained and the view could not be cut off from the network; WebView2 may not offer the view's following requests to the filter",
+                FAILED(result) ? result : E_FAIL);
+}
+
+// Sends the offline switch; its completion reports. Measured on runtime 158: with the Network domain enabled beforehand, it
+// let none of the opener's requests through; without it, requests issued in the same task as the window request still did.
+constexpr wchar_t offline_parameters[] = L"{\"offline\":true,\"latency\":0,\"downloadThroughput\":-1,\"uploadThroughput\":-1}";
+HRESULT send_offline(ICoreWebView2* core, const std::shared_ptr<windows_request_gate>& gate, cut_off_report report) noexcept {
+    try {
+        std::weak_ptr<windows_request_gate> weak = gate;
+        return core->CallDevToolsProtocolMethod(L"Network.emulateNetworkConditions", offline_parameters,
+            Callback<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler>([weak, report](HRESULT result, LPCWSTR) -> HRESULT {
+                auto alive = weak.lock();
+                if (!alive) return S_OK;
+                if (report != cut_off_report::none && test_inject_failure("cut_off_async")) result = E_FAIL;
+                report_offline_result(*alive, report, result);
+                return S_OK;
+            }).Get());
+    } catch (...) { return E_OUTOFMEMORY; }
+}
+
+// The DevTools Network domain of a filtered view, enabled with its request filter, so that the offline switch takes effect
+// at once. It keeps (almost) nothing for a DevTools client. WebView2 may process DevTools commands out of order
+// (ICoreWebView2::CallDevToolsProtocolMethod), so an offline switch asked for while it is pending is sent from its completion.
+constexpr wchar_t network_enable_parameters[] = L"{\"maxTotalBufferSize\":1024,\"maxResourceBufferSize\":1024,\"maxPostDataSize\":0}";
+void enable_network_domain(ICoreWebView2* core, const std::shared_ptr<windows_request_gate>& gate) noexcept {
+    if (!core || !gate || gate->network != windows_request_gate::network_domain::off) return;
+    try {
+        std::weak_ptr<windows_request_gate> weak = gate;
+        const auto started = core->CallDevToolsProtocolMethod(L"Network.enable", network_enable_parameters,
+            Callback<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler>([weak, core = ComPtr<ICoreWebView2>(core)](HRESULT result, LPCWSTR) -> HRESULT {
+                auto alive = weak.lock();
+                if (!alive) return S_OK;
+                alive->network = SUCCEEDED(result) ? windows_request_gate::network_domain::enabled : windows_request_gate::network_domain::failed;
+                if (FAILED(result) && alive->app)
+                    neo_log(alive->app, NEOASTRA_LOG_WARNING, "request_filter",
+                            "The DevTools network domain of a filtered view could not be enabled; cutting the view off may not take effect at once", result);
+                if (alive->offline_queued) {
+                    alive->offline_queued = false;
+                    const auto report = static_cast<cut_off_report>(alive->offline_report);
+                    alive->offline_report = 0;
+                    const auto sent = send_offline(core.Get(), alive, report);
+                    if (FAILED(sent)) report_offline_result(*alive, report, sent);
+                }
+                return S_OK;
+            }).Get());
+        if (SUCCEEDED(started)) gate->network = windows_request_gate::network_domain::pending;
+        else gate->network = windows_request_gate::network_domain::failed;
+    } catch (...) { }
+}
+
+// Cuts a view off from the network through the DevTools offline emulation, for as long as its controller lives, whatever it
+// loads. Sent, not awaited: waiting for it while a window request is deferred stalls the page (measured: 17 s). While the
+// Network domain is pending, the switch is sent at once and again once the domain is confirmed. The result is the one of
+// sending (or queueing); the completion reports as `report` says (see report_offline_result).
+HRESULT cut_off_from_network(ICoreWebView2* core, const std::shared_ptr<windows_request_gate>& gate, cut_off_report report) noexcept {
+    if (!core) return E_POINTER;
+    if (test_inject_failure("cut_off")) return E_FAIL;
+    enable_network_domain(core, gate); // does nothing when the filter enabled it already
+    if (gate && gate->network == windows_request_gate::network_domain::pending) {
+        // Sent at once as well, unreported: it may act before the domain is confirmed. The one sent again from the domain's
+        // completion is the one that reports. The command is idempotent.
+        gate->offline_queued = true;
+        gate->offline_report = std::max(gate->offline_report, static_cast<unsigned char>(report));
+        (void)send_offline(core, gate, cut_off_report::none);
+        return S_OK;
+    }
+    return send_offline(core, gate, report);
+}
+
+// ICoreWebView2_22 comes with SDK 1.0.2365.46, whose release notes require WebView2 Runtime 122.0.2365.46 or later
+// (learn.microsoft.com ICoreWebView2_22 "Introduced 1.0.2365.46"; release notes "Release SDK 1.0.2365.46, for Runtime 122").
+// This only gates what the environment promises before a view exists; the interface query on a created view stays
+// authoritative, and a runtime below the floor fails closed.
+bool runtime_supports_request_filter(const std::string& version) noexcept {
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+    if (test_request_filter_unavailable()) return false;
+#endif
+    constexpr unsigned minimum[4] = {122, 0, 2365, 46};
+    unsigned parts[4]{};
+    size_t index = 0;
+    // A channel suffix such as " beta", " dev" or " canary" ends the number; a version without any digit is refused.
+    bool digits{};
+    for (const char c : version) {
+        if (c == '.') { if (++index == 4) break; }
+        else if (c >= '0' && c <= '9') { parts[index] = parts[index] * 10 + static_cast<unsigned>(c - '0'); digits = true; }
+        else break;
+    }
+    if (!digits) return false;
+    for (size_t i = 0; i < 4; ++i) {
+        if (parts[i] != minimum[i]) return parts[i] > minimum[i];
+    }
+    return true;
+}
+
+bool request_filter_snapshot_active(const neoastra_view_t* view) noexcept {
+    const auto snapshot = std::atomic_load(&view->request_filter);
+    return snapshot && !snapshot->empty();
+}
+
+// Fails closed: a snapshot that cannot be evaluated refuses.
+bool request_refused(const neoastra_view_t* view, std::string_view uri, neoastra_resource_kind_t kind) noexcept {
+    try {
+        const auto snapshot = std::atomic_load(&view->request_filter);
+        return snapshot && !snapshot->empty() && snapshot->refuses(uri, kind);
+    } catch (...) { return true; }
+}
+
+HRESULT query_request_filter_interface(windows_view* state, ComPtr<ICoreWebView2_22>& output) noexcept {
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+    if (test_request_filter_unavailable()) return E_NOINTERFACE;
+#endif
+    return state->core.As(&output);
+}
+
+// The address a refused request is rewritten to when WebView2 accepts no response for it. The `.invalid` top-level domain
+// never resolves (RFC 6761) and port 1 is on Chromium's list of restricted ports: the request fails inside the engine and
+// cannot reach the refused destination, nor any other server. Rewriting the URI, method and body of a request in
+// WebResourceRequested is documented ("Custom management of network requests"); the tests prove it on the refused path.
+constexpr wchar_t neutralized_request_uri[] = L"http://refused.invalid:1/";
+
+// Refuses a request at once, without a deferral: a held request is released by the engine when the view is torn down.
+// In this order: a fresh empty response with `status`, the empty 403 prepared when the filter was installed (no allocation),
+// and when WebView2 accepts neither response, the request itself is rewritten to `neutralized_request_uri`, without body.
+// Each step is independent of the previous one. Returns false only if all three failed, the case no engine API can stop.
+// Every refusal of this backend comes here: refused navigations as well as requests that the request filter refuses.
+// Each fallback is logged once per gate (view or popup sink), not per request: a page can issue many. The unsafe case, which
+// no fallback stops, is logged every time. `status` applies to the fresh response; the prepared one is always 403.
+void log_refusal_fallback(windows_request_gate& gate, unsigned bit, neoastra_log_level_t level, const char* message, HRESULT result) noexcept {
+    if (gate.refusal_fallbacks_logged & bit) return;
+    gate.refusal_fallbacks_logged |= bit;
+    neo_log(gate.app, level, "request_filter", message, result);
+}
+
+bool refuse_request(windows_request_gate& gate, ICoreWebView2WebResourceRequestedEventArgs* args,
+                    ICoreWebView2WebResourceRequest* request, int status) noexcept {
+    ComPtr<ICoreWebView2WebResourceResponse> fresh;
+    auto result = test_inject_failure("create") ? E_OUTOFMEMORY : !gate.environment ? E_POINTER
+        : gate.environment->CreateWebResourceResponse(nullptr, status, default_reason(static_cast<uint32_t>(status)), L"", &fresh);
+    if (SUCCEEDED(result) && fresh) {
+        result = test_inject_failure("assign") ? E_FAIL : args->put_Response(fresh.Get());
+        if (SUCCEEDED(result)) return true;
+    } else if (SUCCEEDED(result)) result = E_POINTER;
+    log_refusal_fallback(gate, 1u, NEOASTRA_LOG_ERROR, "Could not refuse a request with a fresh response", result);
+    if (gate.denial_response && !test_inject_failure("prepared")) {
+        result = test_inject_failure("assign_prepared") ? E_FAIL : args->put_Response(gate.denial_response.Get());
+        if (SUCCEEDED(result)) return true;
+        log_refusal_fallback(gate, 2u, NEOASTRA_LOG_ERROR, "Could not refuse a request with the prepared response", result);
+    }
+    ComPtr<ICoreWebView2WebResourceRequest> native_request(request);
+    if (!native_request) (void)args->get_Request(&native_request);
+    result = !native_request ? E_POINTER : test_inject_failure("neutralize") ? E_FAIL : native_request->put_Uri(neutralized_request_uri);
+    if (SUCCEEDED(result)) {
+        // The destination is already harmless; method and body only keep the failing request small.
+        (void)native_request->put_Method(L"GET");
+        (void)native_request->put_Content(nullptr);
+        log_refusal_fallback(gate, 4u, NEOASTRA_LOG_WARNING, "Refused a request by rewriting it to an address that fails", S_OK);
+        return true;
+    }
+    neo_log(gate.app, NEOASTRA_LOG_ERROR, "request_filter", "UNSAFE: WebView2 accepted neither a response nor a rewrite of a refused request", result);
+    return false;
+}
+
+// The empty 403 of `refuse_request`, created while a filter is prepared, so that refusing needs no allocation when a fresh
+// response cannot be made. Its failure fails the preparation: the previous filter stays installed, a new view or popup is
+// not created.
+neoastra_result_t prepare_denial_response(neoastra_view_t* view, neoastra_error_t** error) noexcept {
+    auto* state = static_cast<windows_view*>(view->platform);
+    auto* gate = state ? state->gate.get() : nullptr;
+    if (!gate || !gate->environment) return neo_fail(error, NEOASTRA_ERROR_NOT_INITIALIZED, "WebView2 view is not initialized", 0, "webview2");
+    if (gate->denial_response) return NEOASTRA_OK;
+    const auto result = test_inject_failure("prepare") ? E_OUTOFMEMORY
+        : gate->environment->CreateWebResourceResponse(nullptr, 403, L"Forbidden", L"", &gate->denial_response);
+    if (FAILED(result) || !gate->denial_response) {
+        gate->denial_response.Reset();
+        return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, "Could not prepare the refusal of requests", FAILED(result) ? result : E_POINTER, "webview2");
+    }
+    return NEOASTRA_OK;
+}
+
+// The one broad registration of the request filter: every request of DOCUMENT sources (documents, frames, their
+// subresources and dedicated workers), never service or shared workers, whose events WebView2 raises for the profile.
+HRESULT add_request_source_filter(ICoreWebView2* core) noexcept {
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+    if (test_request_filter_unavailable()) return E_NOINTERFACE;
+#endif
+    ComPtr<ICoreWebView2_22> core22;
+    auto result = ComPtr<ICoreWebView2>(core).As(&core22);
+    if (SUCCEEDED(result)) result = core22->AddWebResourceRequestedFilterWithRequestSourceKinds(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                                                                                                COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_DOCUMENT);
+    return result;
+}
+
+// Registers the request filter of a view once. It stays registered until the controller is closed: see
+// close_gate_controller, which must not open a window in which requests are no longer offered to the handler.
+neoastra_result_t ensure_request_filter_hook(neoastra_view_t* view, neoastra_error_t** error) noexcept {
+    auto* state = static_cast<windows_view*>(view->platform);
+    if (!state || !state->core) return neo_fail(error, NEOASTRA_ERROR_NOT_INITIALIZED, "WebView2 view is not initialized", 0, "webview2");
+    if (state->request_filter_hook) return NEOASTRA_OK;
+    if (!state->gate || !state->gate->denial_response)
+        return neo_fail(error, NEOASTRA_ERROR_INVALID_STATE, "The refusal of requests was not prepared", 0, "webview2");
+    ComPtr<ICoreWebView2_22> core22;
+    auto result = query_request_filter_interface(state, core22);
+    if (FAILED(result)) {
+        if (auto* environment = static_cast<windows_environment*>(view->environment->platform)) environment->request_filter_ready = false;
+        return neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "This WebView2 runtime does not support request-source filters", result, "webview2");
+    }
+    // The interface is there: the environment promises the filter again, also after a view that once lacked it.
+    if (auto* environment = static_cast<windows_environment*>(view->environment->platform)) environment->request_filter_ready = true;
+    result = add_request_source_filter(state->core.Get());
+    if (FAILED(result)) return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, "WebView2 could not register the request filter", result, "webview2");
+    state->request_filter_hook = true;
+    enable_network_domain(state->core.Get(), state->gate);
+    return NEOASTRA_OK;
+}
+
+struct windows_prepared_request_filter final : neo_prepared_request_filter {
+    explicit windows_prepared_request_filter(bool empty) : empty(empty) {}
+    // An empty list needs no engine registration; a registered view keeps its stable hook and just sees the new snapshot.
+    neoastra_result_t install(neoastra_view_t* view, neoastra_error_t** error) noexcept override {
+        return empty ? NEOASTRA_OK : ensure_request_filter_hook(view, error);
+    }
+    bool empty;
+};
+
 void append_json_string(std::string& output, const std::string& value) {
     output.push_back('"');
     for (const auto byte : value) {
@@ -624,7 +1057,7 @@ void remove_view_events(windows_view* state) noexcept {
     state->core->remove_DocumentTitleChanged(state->title_changed);
     state->core->remove_HistoryChanged(state->history_changed);
     if (state->message_registered) state->core->remove_WebMessageReceived(state->message_received);
-    state->core->remove_WebResourceRequested(state->web_resource_requested);
+    // WebResourceRequested stays: see close_gate_controller.
     state->core->remove_PermissionRequested(state->permission_requested);
     state->core->remove_NewWindowRequested(state->new_window_requested);
     state->core->remove_ProcessFailed(state->process_failed);
@@ -639,6 +1072,16 @@ void remove_view_events(windows_view* state) noexcept {
     for (auto& event : state->world_events) event.first->remove_DevToolsProtocolEventReceived(event.second);
     state->world_events.clear();
     state->events_registered = false;
+}
+
+// WebView2 sends a request whose WebResourceRequested event is still pending (not yet answered by this handler) when
+// the controller is closed, without asking: measured under continuous page and frame traffic, the requests reached their
+// destination during Close(), never having been offered to the handler. Removing the handler or the request-source
+// registration first opens the same gap. So a gate is closed in this order: Close(), and only then the handler goes.
+void close_gate_controller(windows_request_gate* gate, ICoreWebView2Controller* controller, ICoreWebView2* core) noexcept {
+    if (controller) controller->Close();
+    if (gate && core && gate->resource_registered) core->remove_WebResourceRequested(gate->resource_token);
+    if (gate) gate->resource_registered = false;
 }
 
 neoastra_result_t windows_download_command(neoastra_download_t* download, uint32_t command) noexcept {
@@ -803,22 +1246,74 @@ struct permission_decision_context {
 };
 
 struct new_window_decision_context {
+    // Owner-bound like navigation_decision_context::view: the view abandons its pending decisions before it is destroyed,
+    // so a decision settles while the view still exists. Nothing retains the view, a pending popup never delays its disposal.
+    neoastra_view_t* view{};
+    std::string uri_utf8; // The original address, for the snapshot check: no conversion in the noexcept completion.
     ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args;
     ComPtr<ICoreWebView2Deferral> deferral;
     ComPtr<ICoreWebView2> core;
     std::wstring uri;
 };
 
+void contain_popup(neoastra_view_t* opener, ICoreWebView2* opener_core, ICoreWebView2NewWindowRequestedEventArgs* args,
+                   ICoreWebView2Deferral* deferral, std::function<void()> after) noexcept;
+HRESULT reattach_request_filter(windows_view* target) noexcept;
+
+// A filtered opener never answers a window request "handled without a window" while it can avoid it: see windows_popup_sink.
+// An unfiltered opener keeps that answer for a refused or cancelled request.
 void new_window_decided(void* pointer, const neoastra_decision_response_t* response) noexcept {
     std::unique_ptr<new_window_decision_context> context(static_cast<new_window_decision_context*>(pointer));
-    context->args->put_Handled(TRUE);
-    if (response->action == NEOASTRA_DECISION_ALLOW && response->target_view) {
-        auto* target=static_cast<windows_view*>(response->target_view->platform);
-        if(target&&target->core)context->args->put_NewWindow(target->core.Get());
-    } else if (response->action == NEOASTRA_DECISION_ALLOW) {
-        context->core->Navigate(context->uri.c_str());
+    // The snapshot may have changed while the decision was deferred: a refused address opens neither as popup nor as fallback navigation.
+    const bool destroying = context->view && context->view->ui_destroyed.load(std::memory_order_acquire);
+    const bool filtered = context->view && request_filter_snapshot_active(context->view);
+    const bool refused = context->view && request_refused(context->view, context->uri_utf8, NEOASTRA_RESOURCE_DOCUMENT);
+    if (!refused && response->action == NEOASTRA_DECISION_ALLOW && response->target_view) {
+        auto* target = static_cast<windows_view*>(response->target_view->platform);
+        if (target && target->core && SUCCEEDED(context->args->put_NewWindow(target->core.Get()))) {
+            if (request_filter_snapshot_active(response->target_view) && FAILED(reattach_request_filter(target))) {
+                // The popup must not load without its filter. It is cut off from the network first; then the request is
+                // completed: the engine still holds the target while the event is pending, so the view is disposed only after
+                // the deferral returned. The report comes last, because the host's log callback may release the views.
+                auto* app = response->target_view->environment->app;
+                (void)cut_off_from_network(target->core.Get(), target->gate, cut_off_report::none);
+                context->args->put_Handled(TRUE);
+                context->deferral->Complete();
+                response->target_view->destroy_ui_once();
+                neo_log(app, NEOASTRA_LOG_ERROR, "request_filter",
+                        "The request filter of a popup could not be registered after its assignment; the popup view is disposed", E_FAIL);
+                return;
+            }
+            context->args->put_Handled(TRUE);
+            context->deferral->Complete();
+            return;
+        }
+        // The target could not be assigned: what follows answers the request as a refused one.
     }
+    if (destroying) {
+        // A view being destroyed abandons its decisions: no sink and no fallback navigation. Answered without a window,
+        // WebView2 may stop offering its requests (see answer_uncontained_popup): a filtered one is cut off from the network
+        // first, as its destruction does (see neo_platform_view_destroy).
+        if (filtered) {
+            auto* state = static_cast<windows_view*>(context->view->platform);
+            (void)cut_off_from_network(context->core.Get(), state ? state->gate : std::shared_ptr<windows_request_gate>{}, cut_off_report::teardown);
+        }
+        context->args->put_Handled(TRUE);
+        context->deferral->Complete();
+        return;
+    }
+    std::function<void()> after;
+    if (!refused && response->action == NEOASTRA_DECISION_ALLOW && !response->target_view) {
+        try { after = [core = context->core, uri = context->uri] { (void)core->Navigate(uri.c_str()); }; }
+        catch (...) { }
+    }
+    if (filtered) {
+        contain_popup(context->view, context->core.Get(), context->args.Get(), context->deferral.Get(), std::move(after));
+        return;
+    }
+    context->args->put_Handled(TRUE);
     context->deferral->Complete();
+    if (after) after();
 }
 
 void permission_decided(void* pointer, const neoastra_decision_response_t* response) noexcept {
@@ -834,7 +1329,9 @@ void permission_decided(void* pointer, const neoastra_decision_response_t* respo
 
 void navigation_decided(void* pointer, const neoastra_decision_response_t* response) noexcept {
     std::unique_ptr<navigation_decision_context> context(static_cast<navigation_decision_context*>(pointer));
-    const bool cancel = response->action != NEOASTRA_DECISION_ALLOW && response->action != NEOASTRA_DECISION_DEFAULT;
+    bool cancel = response->action != NEOASTRA_DECISION_ALLOW && response->action != NEOASTRA_DECISION_DEFAULT;
+    // The snapshot may have changed while the decision was deferred.
+    if (!cancel && request_refused(context->view, context->uri, NEOASTRA_RESOURCE_DOCUMENT)) cancel = true;
     context->args->put_Cancel(cancel ? TRUE : FALSE);
     // Here and not after the decision: opening the address outside the view comes next, and lets the thread take the request.
     remember_navigation(context->view, context->uri, cancel);
@@ -914,6 +1411,567 @@ HRESULT register_view_focus(neoastra_view_t* view, windows_view* state) {
     return result;
 }
 
+// Every WebResourceRequested event of a view or popup sink. The handler outlives the closing of its controller (see
+// close_gate_controller). A gate without a view refuses every request: a destroyed view, or a popup sink. While a view is
+// being destroyed, the handler refuses what the snapshot refuses and serves nothing.
+void handle_resource_request(windows_request_gate& gate, ICoreWebView2WebResourceRequestedEventArgs* args) noexcept {
+    auto* view = gate.view;
+    if (!view) { refuse_request(gate, args, nullptr, 403); return; }
+    neo_retain_guard owner(view);
+    const bool closing = !owner || view->ui_destroyed.load(std::memory_order_acquire);
+    ComPtr<ICoreWebView2WebResourceRequest> native_request;
+    COREWEBVIEW2_WEB_RESOURCE_CONTEXT native_kind{};
+    LPWSTR raw_uri{}, raw_method{};
+    auto result = args->get_Request(&native_request);
+    if (SUCCEEDED(result)) result = args->get_ResourceContext(&native_kind);
+    if (SUCCEEDED(result)) result = native_request->get_Uri(&raw_uri);
+    if (SUCCEEDED(result)) result = native_request->get_Method(&raw_method);
+    if (FAILED(result)) {
+        CoTaskMemFree(raw_uri);
+        CoTaskMemFree(raw_method);
+        // A request that cannot be read cannot be cleared: refuse it while a filter is installed.
+        if (request_filter_snapshot_active(view)) refuse_request(gate, args, native_request.Get(), 403);
+        return;
+    }
+    try {
+        const auto uri = take_string(raw_uri);
+        raw_uri = nullptr;
+        const auto method = take_string(raw_method);
+        raw_method = nullptr;
+        if (native_kind == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT && take_refused_navigation(view, uri)) {
+            // WebView2 has dropped the navigation, or drops it with this response: no content, and nothing to show.
+            refuse_request(gate, args, native_request.Get(), 204);
+            return;
+        }
+        // The common matcher decides; custom schemes and other non-network URIs are never network targets for it.
+        if (request_refused(view, uri, portable_resource_kind(native_kind))) {
+            refuse_request(gate, args, native_request.Get(), 403);
+            return;
+        }
+        if (closing) return;
+        const auto* scheme = find_scheme(view->environment, uri);
+        if (!scheme || !scheme->provider) return;
+        const auto headers = request_headers(native_request.Get());
+        if (!neo_resource_request_within_limits(uri, method, headers)) {
+            neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Custom-scheme request metadata exceeded its size limit");
+            return;
+        }
+        neoastra_resource_request_t request{};
+        request.size = sizeof(request);
+        request.version = 1;
+        request.uri = neo_string_view(uri);
+        request.method = neo_string_view(method);
+        request.headers = neo_string_view(headers);
+        request.resource_kind = portable_resource_kind(native_kind);
+        request.main_frame = native_kind == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT ? 1u : 0u;
+        neoastra_resource_response_t response{};
+        response.size = sizeof(response);
+        response.version = 1;
+        neoastra_result_t provider_result = NEOASTRA_ERROR_NATIVE_FAILURE;
+        try { provider_result = scheme->provider(scheme->provider_context, &request, &response); }
+        catch (...) { provider_result = NEOASTRA_ERROR_NATIVE_FAILURE; }
+        if (provider_result != NEOASTRA_OK) {
+            neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Custom-scheme resource provider failed", provider_result);
+            if (response.release && response.release_context) {
+                try { response.release(response.release_context); } catch (...) { }
+            }
+            response = {};
+            response.size = sizeof(response);
+            response.version = 1;
+            response.status_code = 500;
+        }
+        ComPtr<ICoreWebView2WebResourceResponse> native_response;
+        result = create_resource_response(view, response, &native_response);
+        if (response.release && response.release_context) {
+            try { response.release(response.release_context); } catch (...) { }
+        }
+        if (FAILED(result) || !native_response) {
+            neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Could not create a custom-scheme response", result);
+            return;
+        }
+        args->put_Response(native_response.Get());
+    } catch (...) {
+        CoTaskMemFree(raw_uri);
+        CoTaskMemFree(raw_method);
+        neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Custom-scheme request handling failed");
+        if (request_filter_snapshot_active(view)) refuse_request(gate, args, native_request.Get(), 403);
+    }
+}
+
+HRESULT add_resource_handler(ICoreWebView2* core, const std::shared_ptr<windows_request_gate>& gate) noexcept {
+    try {
+        return core->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+            [gate](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+                handle_resource_request(*gate, args);
+                return S_OK;
+            }).Get(), &gate->resource_token);
+    } catch (...) { return E_OUTOFMEMORY; }
+}
+
+// ---- Popup sinks (see windows_popup_sink).
+
+unsigned popup_sink_cap() noexcept {
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+    char value[8]{};
+    if (GetEnvironmentVariableA("NEOASTRA_TEST_SINK_CAP", value, sizeof(value))) return static_cast<unsigned>(std::atoi(value));
+#endif
+    return maximum_popup_sinks;
+}
+
+UINT popup_sink_creation() noexcept {
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+    char value[16]{};
+    if (GetEnvironmentVariableA("NEOASTRA_TEST_SINK_CREATION_MS", value, sizeof(value))) return static_cast<UINT>(std::atoi(value));
+#endif
+    return popup_sink_creation_ms;
+}
+
+unsigned popup_sink_app_cap() noexcept {
+#ifdef NEOASTRA_WINDOWS_TEST_HOOKS
+    char value[16]{};
+    if (GetEnvironmentVariableA("NEOASTRA_TEST_SINK_APP_CAP", value, sizeof(value))) return static_cast<unsigned>(std::atoi(value));
+#endif
+    return maximum_popup_sinks_of_app;
+}
+
+// A window request of a filtered view that could not be contained (no popup sink): it can only be answered without a window,
+// after which WebView2 does not offer every request of the opener to the filter (measured on runtime 158: up to 9 of 18
+// requests overlapping the window requests reached a refused port, and with a deferred answer 5 of 8 kinds of later requests
+// too). So the opener fails closed: it is cut off from the network first (see cut_off_from_network) and stays offline until
+// it is destroyed; in the same measurement none of its requests reached the refused port then. Its service workers are
+// not cut off; they are outside the filter in any case. The fallback navigation of an allowed request is not run.
+// Never silent: the host's log receives an error, last, because the host's callback may destroy the opener: nothing of the
+// request, of the opener or of a sink is used after it. Whether the view is cut off follows from the completion of the
+// offline switch ("Request filter fail-closed" or "Request filter degraded", see cut_off_from_network); a switch that cannot
+// even be sent is reported as degraded here. Without an opener (destroyed meanwhile, which cut it off) the request is only
+// answered.
+void answer_uncontained_popup(neoastra_view_t* opener, ICoreWebView2NewWindowRequestedEventArgs* args, ICoreWebView2Deferral* deferral,
+                              const char* why, HRESULT result) noexcept {
+    if (!opener) {
+        if (args) (void)args->put_Handled(TRUE);
+        if (deferral) (void)deferral->Complete();
+        return;
+    }
+    auto* app = opener->environment->app;
+    auto* state = static_cast<windows_view*>(opener->platform);
+    const auto cut = state ? cut_off_from_network(state->core.Get(), state->gate, cut_off_report::popup) : E_POINTER;
+    if (args) (void)args->put_Handled(TRUE);
+    if (deferral) (void)deferral->Complete();
+    neo_log(app, NEOASTRA_LOG_ERROR, "request_filter", why, result);
+    if (FAILED(cut))
+        neo_log(app, NEOASTRA_LOG_ERROR, "request_filter",
+                "Request filter degraded: a window request of a filtered view could not be contained and the view could not be cut off from the network; WebView2 may not offer the view's following requests to the filter", cut);
+}
+
+void unlink_popup_sink(windows_popup_sink* sink) noexcept {
+    auto* app_state = sink->app ? static_cast<windows_app*>(sink->app->platform) : nullptr;
+    if (!app_state) return;
+    for (auto** link = &app_state->sinks; *link; link = &(*link)->next) {
+        if (*link != sink) continue;
+        *link = sink->next;
+        break;
+    }
+    sink->next = nullptr;
+    if (app_state->dispatcher) KillTimer(app_state->dispatcher, sink->id);
+}
+
+// Closes a sink and frees it. Its own handlers are removed before it is freed (see remove_popup_sink_events).
+void remove_popup_sink_events(windows_popup_sink* sink, ICoreWebView2* core) noexcept;
+void close_popup_sink(windows_popup_sink* sink) noexcept {
+    unlink_popup_sink(sink);
+    if (sink->slot) *sink->slot = nullptr;
+    if (sink->creation_pending) { // its controller still comes, and counts until then (see windows_app::orphaned_sink_creations)
+        auto* app_state = sink->app ? static_cast<windows_app*>(sink->app->platform) : nullptr;
+        if (app_state && app_state->orphaned_sink_creations && ++*app_state->orphaned_sink_creations == maximum_popup_sinks_of_app / 2)
+            neo_log(sink->app, NEOASTRA_LOG_WARNING, "request_filter",
+                    "Controller creations of popup sinks do not complete; they count against the limit of popup sinks of the application until they do",
+                    HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    }
+    // Only teardown closes a sink that still holds its request (its opener or the application goes away): the request is
+    // answered without a window, without its fallback navigation and without a report, since nothing is left to filter.
+    if (sink->args) (void)sink->args->put_Handled(TRUE);
+    if (sink->deferral) (void)sink->deferral->Complete();
+    sink->args.Reset();
+    sink->deferral.Reset();
+    sink->after = nullptr;
+    auto controller = std::move(sink->controller);
+    auto core = std::move(sink->core);
+    close_gate_controller(sink->gate.get(), controller.Get(), core.Get()); // Close() first, then the request handler
+    remove_popup_sink_events(sink, core.Get());
+    controller.Reset(); // Release the COM objects before the sink, whose address their handlers captured.
+    core.Reset();
+    delete sink;
+}
+
+// Closes the sink with this identifier if it is still alive in `app`; false for any other identifier. A sink that still
+// holds its request when its timer fires was not created in time: its opener fails closed (see fail_popup_sink), and a
+// completion that comes later only closes the controller (see popup_sink_created).
+void fail_popup_sink(windows_popup_sink* sink, const char* why, HRESULT result) noexcept;
+bool close_listed_popup_sink(neoastra_app_t* app, UINT_PTR id) noexcept {
+    auto* app_state = static_cast<windows_app*>(app->platform);
+    for (auto* current = app_state ? app_state->sinks : nullptr; current; current = current->next) {
+        if (current->id != id) continue;
+        if (current->deferral) fail_popup_sink(current, "A popup sink was not created in time", HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        else close_popup_sink(current);
+        return true;
+    }
+    return false;
+}
+
+unsigned popup_sinks_of_view(const windows_app* app_state, const neoastra_view_t* view) noexcept {
+    unsigned count{};
+    for (auto* current = app_state->sinks; current; current = current->next)
+        if (current->opener == view) ++count;
+    return count;
+}
+
+unsigned popup_sinks_of_app(const windows_app* app_state) noexcept {
+    unsigned count = app_state->orphaned_sink_creations ? *app_state->orphaned_sink_creations : 0;
+    for (auto* current = app_state->sinks; current; current = current->next) ++count;
+    return count;
+}
+
+// A view is being destroyed: its window requests and their deferrals die with its controller. Each sink that still answers
+// one of them is closed first, so no completion completes a deferral of a closed view (that crashed inside WebView2); the
+// view was cut off from the network before (see neo_platform_view_destroy), since that answer has no window. A sink
+// that was assigned no longer depends on the view and closes by itself (see windows_popup_sink): closed together with its
+// opener, the popup's navigation that was in flight at Close() reached its address without being offered or cancelled
+// (seen on runtime 158 when the opener was disposed right after its window request).
+void close_popup_sinks_of_view(neoastra_app_t* app, neoastra_view_t* view) noexcept {
+    auto* app_state = app ? static_cast<windows_app*>(app->platform) : nullptr;
+    if (!app_state || !view) return;
+    for (auto* current = app_state->sinks; current;) {
+        auto* next = current->next;
+        if (current->opener == view) {
+            current->opener = nullptr;
+            if (current->deferral) {
+                current->after = nullptr; // The fallback navigation belongs to the view that is going away.
+                close_popup_sink(current);
+            }
+        }
+        current = next;
+    }
+}
+
+// ---- Retiring views (see windows_retiring_view).
+
+void close_retiring_view(windows_retiring_view* retiring) noexcept {
+    auto* app_state = retiring->app ? static_cast<windows_app*>(retiring->app->platform) : nullptr;
+    if (app_state) {
+        for (auto** link = &app_state->retiring; *link; link = &(*link)->next) {
+            if (*link != retiring) continue;
+            *link = retiring->next;
+            break;
+        }
+        if (app_state->dispatcher) KillTimer(app_state->dispatcher, retiring->id);
+        if (!app_state->retiring) app_state->retiring_limit_logged = false; // the next burst is logged again
+    }
+    auto controller = std::move(retiring->controller);
+    auto core = std::move(retiring->core);
+    if (core && retiring->navigation_starting.value) core->remove_NavigationStarting(retiring->navigation_starting);
+    if (core && retiring->navigation_completed.value) core->remove_NavigationCompleted(retiring->navigation_completed);
+    if (core && retiring->new_window.value) core->remove_NewWindowRequested(retiring->new_window);
+    close_gate_controller(retiring->gate.get(), controller.Get(), core.Get()); // Close() first, then the request handler
+    delete retiring;
+}
+
+windows_retiring_view* find_retiring_view(neoastra_app_t* app, UINT_PTR id) noexcept {
+    auto* app_state = app ? static_cast<windows_app*>(app->platform) : nullptr;
+    for (auto* current = app_state ? app_state->retiring : nullptr; current; current = current->next)
+        if (current->id == id) return current;
+    return nullptr;
+}
+
+// Closes the retiring view with this identifier if it is still alive in `app`; false for any other identifier.
+bool close_listed_retiring_view(neoastra_app_t* app, UINT_PTR id) noexcept {
+    auto* retiring = find_retiring_view(app, id);
+    if (!retiring) return false;
+    close_retiring_view(retiring);
+    return true;
+}
+
+// Takes the controller of a filtered view that is being destroyed and unloads its document before it closes. False when
+// that cannot start: the caller then closes the controller at once, as for an unfiltered view; that is never silent.
+bool retire_filtered_view(neoastra_app_t* app, windows_view* state) noexcept {
+    auto* app_state = app ? static_cast<windows_app*>(app->platform) : nullptr;
+    if (!app_state || !app_state->dispatcher || !state->controller || !state->core || !state->gate || !state->gate->resource_registered) return false;
+    unsigned retiring_count{};
+    for (auto* current = app_state->retiring; current; current = current->next) ++retiring_count;
+    if (retiring_count >= maximum_retiring_views) {
+        if (!app_state->retiring_limit_logged)
+            neo_log(app, NEOASTRA_LOG_WARNING, "request_filter",
+                    "Too many filtered views are being destroyed at once: further ones close without unloading their document first, protected only by their offline switch", E_OUTOFMEMORY);
+        app_state->retiring_limit_logged = true;
+        return false;
+    }
+    auto* retiring = new (std::nothrow) windows_retiring_view;
+    if (!retiring) {
+        neo_log(app, NEOASTRA_LOG_WARNING, "request_filter",
+                "A filtered view closes without unloading its document first, protected only by its offline switch", E_OUTOFMEMORY);
+        return false;
+    }
+    retiring->app = app;
+    retiring->id = take_timer_id(app_state);
+    retiring->controller = state->controller;
+    retiring->core = state->core;
+    retiring->gate = state->gate;
+    retiring->deadline = GetTickCount64() + retiring_view_lifetime_ms;
+    // Listed before its handlers are added, so that they find it even when the engine raises an event at once.
+    retiring->next = app_state->retiring;
+    app_state->retiring = retiring;
+    const auto dispatcher = app_state->dispatcher;
+    const auto id = retiring->id;
+    HRESULT result;
+    try {
+        // The handlers capture only the application and the identifier: after the retiring view is gone they find nothing.
+        // The navigation to about:blank is the one to wait for; an unrelated navigation neither arms nor moves the timer.
+        result = retiring->core->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+            [app, id](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                auto* current = find_retiring_view(app, id);
+                if (!current || current->navigation_known) return S_OK;
+                LPWSTR raw_uri{};
+                if (SUCCEEDED(args->get_Uri(&raw_uri)) && raw_uri && std::wcscmp(raw_uri, L"about:blank") == 0 &&
+                    SUCCEEDED(args->get_NavigationId(&current->navigation_id)))
+                    current->navigation_known = true;
+                CoTaskMemFree(raw_uri);
+                return S_OK;
+            }).Get(), &retiring->navigation_starting);
+        // The grace timer replaces the lifetime timer once, and never fires past the deadline. It closes the view outside
+        // the controller's own event.
+        if (SUCCEEDED(result)) result = retiring->core->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+            [app, dispatcher, id](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                auto* current = find_retiring_view(app, id);
+                UINT64 navigation_id{};
+                BOOL succeeded{};
+                // Only an unload that succeeded shortens the deadline.
+                if (!current || current->grace_armed || !current->navigation_known || FAILED(args->get_NavigationId(&navigation_id)) ||
+                    navigation_id != current->navigation_id || FAILED(args->get_IsSuccess(&succeeded)) || !succeeded) return S_OK;
+                current->grace_armed = true;
+                const auto now = GetTickCount64();
+                const auto left = now < current->deadline ? current->deadline - now : 0;
+                (void)SetTimer(dispatcher, id, static_cast<UINT>(std::max<ULONGLONG>(USER_TIMER_MINIMUM, std::min<ULONGLONG>(retiring_view_grace_ms, left))), nullptr);
+                return S_OK;
+            }).Get(), &retiring->navigation_completed);
+        // The view's own handlers are gone: an unloading document opens no window. The view is offline already.
+        if (SUCCEEDED(result)) result = retiring->core->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT { (void)args->put_Handled(TRUE); return S_OK; }).Get(), &retiring->new_window);
+    } catch (...) { result = E_OUTOFMEMORY; }
+    // The lifetime timer comes first: once the navigation started, it bounds the retiring view.
+    if (SUCCEEDED(result) && !SetTimer(dispatcher, id, retiring_view_lifetime_ms, nullptr)) {
+        const auto code = GetLastError();
+        result = code ? HRESULT_FROM_WIN32(code) : E_FAIL;
+    }
+    // The view's window may be destroyed right after the view: the hidden dispatcher holds the controller meanwhile.
+    if (SUCCEEDED(result)) result = retiring->controller->put_ParentWindow(dispatcher);
+    if (SUCCEEDED(result)) result = retiring->core->Navigate(L"about:blank");
+    if (FAILED(result)) {
+        for (auto** link = &app_state->retiring; *link; link = &(*link)->next) {
+            if (*link != retiring) continue;
+            *link = retiring->next;
+            break;
+        }
+        KillTimer(dispatcher, id);
+        if (retiring->navigation_starting.value) retiring->core->remove_NavigationStarting(retiring->navigation_starting);
+        if (retiring->navigation_completed.value) retiring->core->remove_NavigationCompleted(retiring->navigation_completed);
+        if (retiring->new_window.value) retiring->core->remove_NewWindowRequested(retiring->new_window);
+        delete retiring;
+        neo_log(app, NEOASTRA_LOG_WARNING, "request_filter",
+                "A filtered view closes without unloading its document first, protected only by its offline switch", result);
+        return false;
+    }
+    return true;
+}
+
+void schedule_popup_sink_close(windows_popup_sink* sink) noexcept {
+    auto* app_state = sink->app ? static_cast<windows_app*>(sink->app->platform) : nullptr;
+    // Not from inside an event of this controller: Close() releases its handlers. A failed post leaves it to the timer.
+    if (app_state && app_state->dispatcher) (void)PostMessageW(app_state->dispatcher, sink_close_message, sink->id, 0);
+}
+
+// Locks a new sink down before it is assigned: settings and handlers that WebView2 allows before put_NewWindow.
+HRESULT lock_popup_sink(windows_popup_sink* sink) noexcept {
+    ComPtr<ICoreWebView2Settings> settings;
+    auto result = sink->core->get_Settings(&settings);
+    if (SUCCEEDED(result)) result = settings->put_IsScriptEnabled(FALSE);
+    if (SUCCEEDED(result)) result = settings->put_IsWebMessageEnabled(FALSE);
+    if (SUCCEEDED(result)) result = settings->put_AreDefaultScriptDialogsEnabled(FALSE);
+    if (SUCCEEDED(result)) result = settings->put_AreDevToolsEnabled(FALSE);
+    if (SUCCEEDED(result)) result = settings->put_AreDefaultContextMenusEnabled(FALSE);
+    if (FAILED(result)) return result;
+    try {
+        result = sink->core->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT { (void)args->put_Cancel(TRUE); return S_OK; }).Get(), &sink->navigation_starting);
+        if (SUCCEEDED(result)) result = sink->core->add_FrameNavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT { (void)args->put_Cancel(TRUE); return S_OK; }).Get(), &sink->frame_navigation_starting);
+        if (SUCCEEDED(result)) result = sink->core->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT { (void)args->put_Handled(TRUE); return S_OK; }).Get(), &sink->new_window);
+        if (SUCCEEDED(result)) result = sink->core->add_PermissionRequested(Callback<ICoreWebView2PermissionRequestedEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2PermissionRequestedEventArgs* args) -> HRESULT { (void)args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY); return S_OK; }).Get(), &sink->permission);
+        ComPtr<ICoreWebView2_4> core4;
+        if (SUCCEEDED(result) && SUCCEEDED(sink->core.As(&core4))) result = core4->add_DownloadStarting(Callback<ICoreWebView2DownloadStartingEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) -> HRESULT { (void)args->put_Cancel(TRUE); return S_OK; }).Get(), &sink->download);
+        if (SUCCEEDED(result)) result = sink->core->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+            [sink](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT { if (!test_hold_popup_sinks()) schedule_popup_sink_close(sink); return S_OK; }).Get(), &sink->navigation_completed);
+    } catch (...) { result = E_OUTOFMEMORY; }
+    return result;
+}
+
+// Removes the sink's own handlers, which capture `sink`, before the sink is freed. Close() stops delivery, but a handler
+// that is still registered in a retained controller could otherwise be called with a freed sink.
+void remove_popup_sink_events(windows_popup_sink* sink, ICoreWebView2* core) noexcept {
+    if (!sink || !core) return;
+    if (sink->navigation_starting.value) core->remove_NavigationStarting(sink->navigation_starting);
+    if (sink->frame_navigation_starting.value) core->remove_FrameNavigationStarting(sink->frame_navigation_starting);
+    if (sink->new_window.value) core->remove_NewWindowRequested(sink->new_window);
+    if (sink->permission.value) core->remove_PermissionRequested(sink->permission);
+    if (sink->download.value) {
+        ComPtr<ICoreWebView2_4> core4;
+        if (SUCCEEDED(ComPtr<ICoreWebView2>(core).As(&core4))) core4->remove_DownloadStarting(sink->download);
+    }
+    if (sink->navigation_completed.value) core->remove_NavigationCompleted(sink->navigation_completed);
+}
+
+// A sink that cannot answer its request: the sink is closed first, then its opener fails closed (see
+// answer_uncontained_popup), so that a host callback during that finds no sink of this request any more. The opener is
+// alive: its destruction closes its sinks first (see close_popup_sinks_of_view).
+void fail_popup_sink(windows_popup_sink* sink, const char* why, HRESULT result) noexcept {
+    auto* opener = sink->opener;
+    auto args = std::move(sink->args);
+    auto deferral = std::move(sink->deferral);
+    sink->after = nullptr;
+    close_popup_sink(sink);
+    answer_uncontained_popup(opener, args.Get(), deferral.Get(), why, result);
+}
+
+// The controller of a sink exists: lock it, assign it, filter it, complete the request.
+void popup_sink_created(const std::shared_ptr<windows_popup_sink*>& slot, const std::shared_ptr<unsigned>& orphans, HRESULT created,
+                        ICoreWebView2Controller* controller) noexcept {
+    auto* sink = *slot;
+    if (!sink) { // Closed (its timer, its opener, shutdown) while creating.
+        if (orphans && *orphans) --*orphans;
+        if (controller) controller->Close();
+        return;
+    }
+    sink->creation_pending = false;
+    if (test_inject_failure("sink") && SUCCEEDED(created)) { if (controller) controller->Close(); controller = nullptr; created = E_OUTOFMEMORY; }
+    if (FAILED(created) || !controller) { fail_popup_sink(sink, "A popup sink could not be created", FAILED(created) ? created : E_POINTER); return; }
+    sink->controller = controller;
+    auto result = controller->put_IsVisible(FALSE);
+    if (SUCCEEDED(result)) result = controller->get_CoreWebView2(&sink->core);
+    if (SUCCEEDED(result)) result = lock_popup_sink(sink);
+    if (SUCCEEDED(result)) result = sink->args->put_NewWindow(sink->core.Get());
+    if (FAILED(result)) { fail_popup_sink(sink, "A popup sink could not be assigned", result); return; }
+    // After the assignment, as WebView2 requires for add_WebResourceRequested: refuse every request of the popup.
+    result = add_request_source_filter(sink->core.Get());
+    if (SUCCEEDED(result)) result = add_resource_handler(sink->core.Get(), sink->gate);
+    if (SUCCEEDED(result)) sink->gate->resource_registered = true;
+    const auto filter_result = result;
+    auto* app = sink->app;
+    // From the assignment on, the sink lives at most popup_sink_lifetime(); should that timer not start, the creation timer
+    // started in contain_popup keeps running and still bounds it.
+    // A fresh identifier: a WM_TIMER of the creation deadline that is already queued must not close the assigned sink.
+    auto* app_state = app ? static_cast<windows_app*>(app->platform) : nullptr;
+    // The creation timer is replaced only once the lifetime timer runs; otherwise it keeps bounding the sink.
+    if (app_state && app_state->dispatcher) {
+        const auto lifetime_id = take_timer_id(app_state);
+        if (SetTimer(app_state->dispatcher, lifetime_id, popup_sink_lifetime(), nullptr)) {
+            KillTimer(app_state->dispatcher, sink->id);
+            sink->id = lifetime_id;
+        }
+    }
+    (void)sink->args->put_Handled(TRUE);
+    const auto deferral = std::move(sink->deferral);
+    const auto after = std::move(sink->after);
+    sink->args.Reset();
+    // Nothing of the sink is used from here on: completing the request and the fallback navigation run engine callbacks.
+    (void)deferral->Complete(); // The popup navigates now, inside the sink, which cancels it.
+    if (after) { try { after(); } catch (...) { } }
+    // Reports last: the host's log callback may destroy the opener.
+    if (FAILED(filter_result)) neo_log(app, NEOASTRA_LOG_ERROR, "request_filter", "A popup sink has no request filter; it still cancels its navigations", filter_result);
+}
+
+// Answers a window request of a filtered opener with a popup sink instead of "handled without a window". `after` runs once
+// the request is completed (the fallback navigation of an allowed request without a target view).
+void contain_popup(neoastra_view_t* opener, ICoreWebView2* opener_core, ICoreWebView2NewWindowRequestedEventArgs* args,
+                   ICoreWebView2Deferral* deferral, std::function<void()> after) noexcept {
+    auto* app = opener->environment->app;
+    auto* app_state = static_cast<windows_app*>(app->platform);
+    auto* environment = static_cast<windows_environment*>(opener->environment->platform);
+    if (!app_state || !app_state->dispatcher || !environment || !environment->value) { answer_uncontained_popup(opener, args, deferral, "No popup sink: the application or environment is shutting down", E_ABORT); return; }
+    if (popup_sinks_of_view(app_state, opener) >= popup_sink_cap()) { answer_uncontained_popup(opener, args, deferral, "No popup sink: the limit of popup sinks of this view is reached", E_OUTOFMEMORY); return; }
+    if (popup_sinks_of_app(app_state) >= popup_sink_app_cap()) { answer_uncontained_popup(opener, args, deferral, "No popup sink: the limit of popup sinks of the application is reached", E_OUTOFMEMORY); return; }
+    // The sink must use the opener's profile, as put_NewWindow requires.
+    ComPtr<ICoreWebView2_13> core13;
+    ComPtr<ICoreWebView2Profile> profile;
+    LPWSTR raw_profile{};
+    BOOL in_private{};
+    auto result = ComPtr<ICoreWebView2>(opener_core).As(&core13);
+    if (SUCCEEDED(result)) result = core13->get_Profile(&profile);
+    if (SUCCEEDED(result)) result = profile->get_ProfileName(&raw_profile);
+    if (SUCCEEDED(result)) result = profile->get_IsInPrivateModeEnabled(&in_private);
+    ComPtr<ICoreWebView2Environment10> environment10;
+    ComPtr<ICoreWebView2ControllerOptions> options;
+    if (SUCCEEDED(result)) result = environment->value.As(&environment10);
+    if (SUCCEEDED(result)) result = environment10->CreateCoreWebView2ControllerOptions(&options);
+    if (SUCCEEDED(result)) result = options->put_ProfileName(raw_profile ? raw_profile : L"");
+    if (SUCCEEDED(result)) result = options->put_IsInPrivateModeEnabled(in_private);
+    CoTaskMemFree(raw_profile);
+    if (FAILED(result)) { answer_uncontained_popup(opener, args, deferral, "No popup sink: the opener's profile could not be read", result); return; }
+    auto* sink = new (std::nothrow) windows_popup_sink;
+    if (!sink) { answer_uncontained_popup(opener, args, deferral, "No popup sink: out of memory", E_OUTOFMEMORY); return; }
+    try { sink->gate = std::make_shared<windows_request_gate>(); sink->slot = std::make_shared<windows_popup_sink*>(sink); } catch (...) { delete sink; answer_uncontained_popup(opener, args, deferral, "No popup sink: out of memory", E_OUTOFMEMORY); return; }
+    sink->app = app;
+    sink->id = take_timer_id(app_state);
+    // The creation is bounded from its start: a controller that never comes fails the request closed (see close_listed_popup_sink).
+    if (!SetTimer(app_state->dispatcher, sink->id, popup_sink_creation(), nullptr)) {
+        const auto timer_error = HRESULT_FROM_WIN32(GetLastError());
+        delete sink;
+        answer_uncontained_popup(opener, args, deferral, "No popup sink: no timer could bound its creation", FAILED(timer_error) ? timer_error : E_FAIL);
+        return;
+    }
+    sink->opener = opener;
+    sink->gate->app = app;
+    sink->gate->environment = environment->value;
+    (void)environment->value->CreateWebResourceResponse(nullptr, 403, L"Forbidden", L"", &sink->gate->denial_response); // optional
+    sink->args = args;
+    sink->deferral = deferral;
+    sink->after = std::move(after);
+    sink->next = app_state->sinks;
+    app_state->sinks = sink;
+    // Test builds: "sink_never" starts no creation, so that only the creation deadline ends the sink.
+    const bool started = !test_inject_failure("sink_never");
+    try {
+        if (!started) result = S_OK;
+        else result = environment10->CreateCoreWebView2ControllerWithOptions(app_state->dispatcher, options.Get(),
+            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>([slot = sink->slot, orphans = app_state->orphaned_sink_creations](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
+                popup_sink_created(slot, orphans, created, controller);
+                return S_OK;
+            }).Get());
+    } catch (...) { result = E_OUTOFMEMORY; }
+    if (SUCCEEDED(result)) sink->creation_pending = started;
+    else {
+        fail_popup_sink(sink, "No popup sink: its controller could not be started", result);
+    }
+}
+
+// A tracked popup: after put_NewWindow assigned the target, its request filter is registered again, as WebView2 requires for
+// add_WebResourceRequested (the registration from the view's creation preceded the assignment). The new handler is added
+// before the old one is removed, while the popup has not navigated yet.
+HRESULT reattach_request_filter(windows_view* target) noexcept {
+    if (!target || !target->core || !target->gate) return E_POINTER;
+    if (test_inject_failure("popup_hook")) return E_OUTOFMEMORY;
+    const auto previous = target->gate->resource_token;
+    const bool had_handler = target->gate->resource_registered;
+    auto result = add_request_source_filter(target->core.Get());
+    if (SUCCEEDED(result)) result = add_resource_handler(target->core.Get(), target->gate);
+    if (FAILED(result)) { target->gate->resource_token = previous; return result; }
+    if (had_handler) target->core->remove_WebResourceRequested(previous);
+    target->gate->resource_registered = true;
+    target->request_filter_hook = true;
+    enable_network_domain(target->core.Get(), target->gate);
+    return S_OK;
+}
+
 HRESULT register_view_events(neoastra_view_t* view, windows_view* state) {
     state->events_registered = true;
     HRESULT result = state->core->add_NavigationStarting(
@@ -930,7 +1988,7 @@ HRESULT register_view_events(neoastra_view_t* view, windows_view* state) {
             args->get_IsRedirected(&redirected);
             auto uri = take_string(raw_uri);
             const auto kind = navigation_kind(args);
-            if (neo_refuses_navigation(view, kind)) {
+            if (neo_refuses_navigation(view, kind) || request_refused(view, uri, NEOASTRA_RESOURCE_DOCUMENT)) {
                 args->put_Cancel(TRUE);
                 remember_navigation(view, uri, true);
                 return S_OK;
@@ -970,7 +2028,15 @@ HRESULT register_view_events(neoastra_view_t* view, windows_view* state) {
         Callback<ICoreWebView2NavigationStartingEventHandler>([view](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
             neo_retain_guard owner(view);
             if (!owner || view->ui_destroyed.load(std::memory_order_acquire)) { args->put_Cancel(TRUE); return S_OK; }
-            if (neo_refuses_navigation(view, navigation_kind(args))) args->put_Cancel(TRUE);
+            if (neo_refuses_navigation(view, navigation_kind(args))) { args->put_Cancel(TRUE); return S_OK; }
+            if (request_filter_snapshot_active(view)) {
+                // A frame address that cannot be read cannot be cleared either.
+                LPWSTR raw_frame_uri{};
+                const bool known = SUCCEEDED(args->get_Uri(&raw_frame_uri)) && raw_frame_uri;
+                std::string frame_uri;
+                if (known) { try { frame_uri = take_string(raw_frame_uri); } catch (...) { CoTaskMemFree(raw_frame_uri); } }
+                if (!known || request_refused(view, frame_uri, NEOASTRA_RESOURCE_DOCUMENT)) args->put_Cancel(TRUE);
+            }
             return S_OK;
         }).Get(), &state->frame_navigation_starting);
     if (FAILED(result)) return result;
@@ -1077,82 +2143,13 @@ HRESULT register_view_events(neoastra_view_t* view, windows_view* state) {
     // Every document, for the request of a navigation that the host refuses.
     result = state->core->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
     if (FAILED(result)) return result;
-    result = state->core->add_WebResourceRequested(
-        Callback<ICoreWebView2WebResourceRequestedEventHandler>([view](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
-            neo_retain_guard owner(view);
-            if (!owner || view->ui_destroyed.load(std::memory_order_acquire)) return S_OK;
-            ComPtr<ICoreWebView2WebResourceRequest> native_request;
-            COREWEBVIEW2_WEB_RESOURCE_CONTEXT native_kind{};
-            LPWSTR raw_uri{}, raw_method{};
-            auto result = args->get_Request(&native_request);
-            if (SUCCEEDED(result)) result = args->get_ResourceContext(&native_kind);
-            if (SUCCEEDED(result)) result = native_request->get_Uri(&raw_uri);
-            if (SUCCEEDED(result)) result = native_request->get_Method(&raw_method);
-            if (FAILED(result)) { CoTaskMemFree(raw_uri); CoTaskMemFree(raw_method); return S_OK; }
-            try {
-                const auto uri = take_string(raw_uri);
-                raw_uri = nullptr;
-                const auto method = take_string(raw_method);
-                raw_method = nullptr;
-                if (native_kind == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT && take_refused_navigation(view, uri)) {
-                    // WebView2 has dropped the navigation, or drops it with this response: no content, and nothing to show.
-                    neoastra_resource_response_t refused{};
-                    refused.size = sizeof(refused);
-                    refused.version = 1;
-                    refused.status_code = 204;
-                    ComPtr<ICoreWebView2WebResourceResponse> native_response;
-                    if (SUCCEEDED(create_resource_response(view, refused, &native_response)) && native_response) args->put_Response(native_response.Get());
-                    return S_OK;
-                }
-                const auto* scheme = find_scheme(view->environment, uri);
-                if (!scheme || !scheme->provider) return S_OK;
-                const auto headers = request_headers(native_request.Get());
-                if (!neo_resource_request_within_limits(uri, method, headers)) {
-                    neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Custom-scheme request metadata exceeded its size limit");
-                    return S_OK;
-                }
-                neoastra_resource_request_t request{};
-                request.size = sizeof(request);
-                request.version = 1;
-                request.uri = neo_string_view(uri);
-                request.method = neo_string_view(method);
-                request.headers = neo_string_view(headers);
-                request.resource_kind = portable_resource_kind(native_kind);
-                request.main_frame = native_kind == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT ? 1u : 0u;
-                neoastra_resource_response_t response{};
-                response.size = sizeof(response);
-                response.version = 1;
-                neoastra_result_t provider_result = NEOASTRA_ERROR_NATIVE_FAILURE;
-                try { provider_result = scheme->provider(scheme->provider_context, &request, &response); }
-                catch (...) { provider_result = NEOASTRA_ERROR_NATIVE_FAILURE; }
-                if (provider_result != NEOASTRA_OK) {
-                    neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Custom-scheme resource provider failed", provider_result);
-                    if (response.release && response.release_context) {
-                        try { response.release(response.release_context); } catch (...) { }
-                    }
-                    response = {};
-                    response.size = sizeof(response);
-                    response.version = 1;
-                    response.status_code = 500;
-                }
-                ComPtr<ICoreWebView2WebResourceResponse> native_response;
-                result = create_resource_response(view, response, &native_response);
-                if (response.release && response.release_context) {
-                    try { response.release(response.release_context); } catch (...) { }
-                }
-                if (FAILED(result) || !native_response) {
-                    neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Could not create a custom-scheme response", result);
-                    return S_OK;
-                }
-                args->put_Response(native_response.Get());
-            } catch (...) {
-                CoTaskMemFree(raw_uri);
-                CoTaskMemFree(raw_method);
-                neo_log(view->environment->app, NEOASTRA_LOG_ERROR, "resource", "Custom-scheme request handling failed");
-            }
-            return S_OK;
-        }).Get(), &state->web_resource_requested);
+    try { state->gate = std::make_shared<windows_request_gate>(); } catch (...) { return E_OUTOFMEMORY; }
+    state->gate->view = view;
+    state->gate->app = view->environment->app;
+    if (auto* environment = static_cast<windows_environment*>(view->environment->platform)) state->gate->environment = environment->value;
+    result = add_resource_handler(state->core.Get(), state->gate);
     if (FAILED(result)) return result;
+    state->gate->resource_registered = true;
 
     if (view->bridge_policy != NEOASTRA_BRIDGE_DISABLED) {
     result = state->core->add_WebMessageReceived(
@@ -1239,10 +2236,20 @@ HRESULT register_view_events(neoastra_view_t* view, windows_view* state) {
             auto result = args->get_Uri(&raw_uri);
             if (SUCCEEDED(result)) result = args->get_IsUserInitiated(&user_initiated);
             if (SUCCEEDED(result)) result = args->GetDeferral(&deferral);
-            if (FAILED(result)) { CoTaskMemFree(raw_uri); return result; }
+            if (FAILED(result)) {
+                CoTaskMemFree(raw_uri);
+                // Left unhandled, WebView2 would open a window of its own: a filtered view fails closed instead.
+                if (!request_filter_snapshot_active(view)) return result;
+                answer_uncontained_popup(view, args, deferral.Get(), "A window request of a filtered view could not be read", result);
+                return S_OK;
+            }
             try {
                 auto uri = take_string(raw_uri);
                 raw_uri = nullptr;
+                if (request_refused(view, uri, NEOASTRA_RESOURCE_DOCUMENT)) {
+                    contain_popup(view, core, args, deferral.Get(), nullptr); // no popup, no window
+                    return S_OK;
+                }
                 std::string name;
                 ComPtr<ICoreWebView2NewWindowRequestedEventArgs2> args2;
                 if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))) && SUCCEEDED(args2->get_Name(&raw_name))) {
@@ -1254,20 +2261,29 @@ HRESULT register_view_events(neoastra_view_t* view, windows_view* state) {
                 context->deferral = deferral;
                 context->core = core;
                 context->uri = widen(uri);
+                context->uri_utf8 = uri;
+                context->view = view;
+                // Until the context is handed to the decision, the unique_ptr frees it when an allocation fails.
                 auto* decision = new neoastra_decision;
                 neo_configure_decision(decision, view, NEOASTRA_DECISION_NEW_WINDOW, NEOASTRA_DECISION_CANCEL);
                 decision->completion = new_window_decided;
                 decision->completion_context = context.release();
-                decision->external_uri = uri;
-                neo_emit_view(view, NEOASTRA_EVENT_NEW_WINDOW_REQUESTED, 0, &name, &uri, user_initiated ? NEOASTRA_NEW_WINDOW_REQUEST_USER_INITIATED : 0, 0, decision);
-                neo_finish_decision_event(view, decision);
+                try {
+                    if (test_inject_failure("new_window")) throw std::bad_alloc();
+                    decision->external_uri = uri;
+                    neo_emit_view(view, NEOASTRA_EVENT_NEW_WINDOW_REQUESTED, 0, &name, &uri, user_initiated ? NEOASTRA_NEW_WINDOW_REQUEST_USER_INITIATED : 0, 0, decision);
+                    neo_finish_decision_event(view, decision);
+                } catch (...) {
+                    // Abandoning runs new_window_decided with the default CANCEL: handled, deferral completed, context freed.
+                    decision->abandon();
+                }
                 decision->release();
                 return S_OK;
             } catch (...) {
                 CoTaskMemFree(raw_uri);
                 CoTaskMemFree(raw_name);
-                args->put_Handled(TRUE);
-                deferral->Complete();
+                if (request_filter_snapshot_active(view)) contain_popup(view, core, args, deferral.Get(), nullptr);
+                else { args->put_Handled(TRUE); deferral->Complete(); }
                 return S_OK;
             }
         }).Get(), &state->new_window_requested);
@@ -1432,19 +2448,25 @@ LRESULT CALLBACK dispatcher_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
     if (!owner) return DefWindowProcW(hwnd, message, wparam, lparam);
     if (app && (message == WM_QUERYENDSESSION || message == WM_ENDSESSION)) return handle_session_message(app, message, wparam);
     if (message == dispatch_message && app) { run_dispatch_slice(app, true); return 0; }
+    if (message == sink_close_message && app) { (void)close_listed_popup_sink(app, wparam); return 0; }
     if (message == quit_message && app) { neo_drain_dispatch(app); PostQuitMessage(app->exit_code.load()); return 0; }
     if (message == WM_TIMER && wparam == dispatch_timer && app) { KillTimer(hwnd, dispatch_timer); run_dispatch_slice(app, false); return 0; }
     if (message == WM_TIMER && wparam == display_timer && app) { KillTimer(hwnd, display_timer); neo_app_displays_changed(app); return 0; }
     // The hidden top-level dispatcher hears of the displays: their topology, the work areas that the taskbar leaves, and their scale.
     if (app && (message == WM_DISPLAYCHANGE || message == WM_DPICHANGED || (message == WM_SETTINGCHANGE && wparam == SPI_SETWORKAREA))) schedule_display_check(app);
+    if (message == WM_TIMER && app && (close_listed_popup_sink(app, wparam) || close_listed_retiring_view(app, wparam))) return 0;
     if (message == WM_TIMER && app) {
         auto* decision = reinterpret_cast<neoastra_decision_t*>(wparam);
         auto* state = static_cast<windows_app*>(app->platform);
         KillTimer(hwnd, wparam);
-        if (state) {
-            auto& timers = state->decision_timers;
-            timers.erase(std::remove(timers.begin(), timers.end(), decision), timers.end());
-        }
+        // A timer id belongs to a popup sink or retiring view (odd, handled above while alive) or to a decision of this
+        // application. KillTimer cannot withdraw a WM_TIMER that was already posted: the id of a sink or view that was
+        // freed meanwhile is no decision, and a second copy of a decision's timer must not expire it again.
+        if (!state) return 0;
+        auto& timers = state->decision_timers;
+        const auto pending = std::find(timers.begin(), timers.end(), decision);
+        if (pending == timers.end()) return 0;
+        timers.erase(pending);
         decision->expire();
         decision->release();
         return 0;
@@ -2162,6 +3184,8 @@ bool neo_platform_initialize(neoastra_app_t* app, neoastra_error_t** error) noex
 
 void neo_platform_shutdown(neoastra_app_t* app) noexcept {
     auto* state = static_cast<windows_app*>(app->platform); if (!state) return;
+    while (state->sinks) close_popup_sink(state->sinks);
+    while (state->retiring) close_retiring_view(state->retiring);
     for (auto* decision : state->decision_timers) { KillTimer(state->dispatcher, reinterpret_cast<UINT_PTR>(decision)); decision->abandon(); decision->release(); }
     state->decision_timers.clear();
     state->desktops.Reset();
@@ -2736,7 +3760,7 @@ bool neo_platform_environment_create_async(neoastra_environment_t* environment,c
                 auto* state = static_cast<windows_environment*>(environment->platform);
                 if (!state) { callback(context, make_error(NEOASTRA_ERROR_DISPOSED, "Application shutdown completed before WebView2 environment creation", E_ABORT)); return S_OK; }
                 if (FAILED(result) || !created) callback(context, make_error(NEOASTRA_ERROR_RUNTIME_UNAVAILABLE, "WebView2 environment creation failed", result));
-                else { state->value = created; callback(context, nullptr); }
+                else { state->value = created; state->request_filter_ready = runtime_supports_request_filter(state->version); callback(context, nullptr); }
                 return S_OK;
             }).Get());
         if (FAILED(result)) { neo_fail(error, NEOASTRA_ERROR_RUNTIME_UNAVAILABLE, "WebView2 environment creation could not be started", result, "webview2"); return false; }
@@ -3595,6 +4619,31 @@ HRESULT register_devtools_shortcut(neoastra_view_t* view, windows_view* state) {
 }
 } // namespace
 
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t* environment) noexcept {
+    const auto* state = environment ? static_cast<const windows_environment*>(environment->platform) : nullptr;
+    return state && state->request_filter_ready.load() ? windows_request_filter_flags : 0;
+}
+
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t* view, const neo_request_filter::filter& rules,
+    neo_request_filter_prepared_callback_t callback, void* context, neoastra_error_t** error) noexcept {
+    auto* state = static_cast<windows_view*>(view->platform);
+    if (!state || !state->core) return neo_fail(error, NEOASTRA_ERROR_NOT_INITIALIZED, "WebView2 view is not initialized", 0, "webview2");
+    if (!rules.empty() && !state->request_filter_hook) {
+        // Reject before accepting preparation: an unsupported engine keeps the previous snapshot.
+        ComPtr<ICoreWebView2_22> core22;
+        const auto result = query_request_filter_interface(state, core22);
+        if (FAILED(result)) {
+            if (auto* environment = static_cast<windows_environment*>(view->environment->platform)) environment->request_filter_ready = false;
+            return neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "This WebView2 runtime does not support request-source filters", result, "webview2");
+        }
+        if (const auto prepared = prepare_denial_response(view, error); prepared != NEOASTRA_OK) return prepared;
+    }
+    auto prepared = std::unique_ptr<neo_prepared_request_filter>(new (std::nothrow) windows_prepared_request_filter(rules.empty()));
+    if (!prepared) return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, "Could not prepare the request filter", E_OUTOFMEMORY, "webview2");
+    callback(context, std::move(prepared), NEOASTRA_OK, nullptr);
+    return NEOASTRA_OK;
+}
+
 bool neo_platform_view_create_async(neoastra_view_t* view,const neoastra_view_options_t*,neo_platform_created_callback_t callback,void* context,neoastra_error_t** error) noexcept {
     auto* environment = static_cast<windows_environment*>(view->environment->platform);
     const auto parent = view_parent(view);
@@ -3637,6 +4686,15 @@ bool neo_platform_view_create_async(neoastra_view_t* view,const neoastra_view_op
             }
             if (SUCCEEDED(result)) result = register_view_focus(view, state);
             if (SUCCEEDED(result)) result = register_view_events(view, state);
+            // A view that starts with a snapshot must refuse from its first request on. The common layer installs an initial
+            // filter of a non-popup view later; a popup inherits its opener's snapshot and gets no such step, so it registers here.
+            if (SUCCEEDED(result) && request_filter_snapshot_active(view)) {
+                neoastra_error_t* hook_error{};
+                if (prepare_denial_response(view, &hook_error) != NEOASTRA_OK || ensure_request_filter_hook(view, &hook_error) != NEOASTRA_OK) {
+                    callback(context, hook_error ? hook_error : make_error(NEOASTRA_ERROR_NATIVE_FAILURE, "WebView2 could not register the request filter", E_FAIL));
+                    return S_OK;
+                }
+            }
             if (SUCCEEDED(result)) intercept_page_drags(view, state);
             if (SUCCEEDED(result)) result = register_devtools_shortcut(view, state);
             // A shown window that holds the keyboard has nothing else to type into: its new browser takes it, as on
@@ -3681,7 +4739,16 @@ bool neo_platform_view_create_async(neoastra_view_t* view,const neoastra_view_op
     if (FAILED(result)) { neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, "WebView2 controller creation could not be started", result, "webview2"); return false; }
     return true;
 }
-void neo_platform_view_destroy(neoastra_view_t* view) noexcept { auto* state=static_cast<windows_view*>(view->platform);if(!state)return;if(view->window)if(auto* host=static_cast<windows_window*>(view->window->platform);host&&host->focused_view==view)host->focused_view=nullptr;end_page_drag(state);remove_view_events(state);for(auto& registration:state->drop_registrations){static_cast<view_drop_target*>(registration.target.Get())->detach_view();if(GetPropW(registration.window,L"NeoAstra.DropTarget")==registration.target.Get())RemovePropW(registration.window,L"NeoAstra.DropTarget");(void)RevokeDragDrop(registration.window);}state->drop_registrations.clear();if(state->controller)state->controller->Close();delete state;view->platform=nullptr; }
+void neo_platform_view_destroy(neoastra_view_t* view) noexcept { auto* state=static_cast<windows_view*>(view->platform);if(!state)return;
+    // A filtered view goes offline before anything of it is torn down: requests that WebView2 does not offer to the handler
+    // while its window requests are answered without a window (see close_popup_sinks_of_view) and while its document
+    // unloads (see windows_retiring_view) fail instead of reaching their destination.
+    const bool filtered=request_filter_snapshot_active(view);
+    if(filtered){const auto cut=cut_off_from_network(state->core.Get(),state->gate,cut_off_report::teardown);if(FAILED(cut)&&state->gate){state->gate->network=windows_request_gate::network_domain::failed;report_offline_result(*state->gate,cut_off_report::teardown,cut);}}
+   if(view->window)if(auto* host=static_cast<windows_window*>(view->window->platform);host&&host->focused_view==view)host->focused_view=nullptr;end_page_drag(state);remove_view_events(state);for(auto& registration:state->drop_registrations){static_cast<view_drop_target*>(registration.target.Get())->detach_view();if(GetPropW(registration.window,L"NeoAstra.DropTarget")==registration.target.Get())RemovePropW(registration.window,L"NeoAstra.DropTarget");(void)RevokeDragDrop(registration.window);}state->drop_registrations.clear();if(state->gate)state->gate->view=nullptr;close_popup_sinks_of_view(view->environment->app,view);
+    // A filtered view unloads its document before its controller closes (see windows_retiring_view).
+    if(!filtered||!retire_filtered_view(view->environment->app,state))close_gate_controller(state->gate.get(),state->controller.Get(),state->core.Get());
+    delete state;view->platform=nullptr; }
 neoastra_result_t neo_platform_view_set_visible(neoastra_view_t* view) noexcept {
     auto* state = static_cast<windows_view*>(view->platform);
     if (!state || !state->controller) return NEOASTRA_ERROR_NOT_INITIALIZED;

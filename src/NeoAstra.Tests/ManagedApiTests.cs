@@ -280,8 +280,11 @@ public sealed class ManagedApiTests
         StringAssert.Contains(windows, "controller_options->put_IsInPrivateModeEnabled(in_private ? TRUE : FALSE)");
         Assert.AreEqual(1, windows.Split("->CreateCoreWebView2Controller(").Length - 1,
             "Only a view that is neither private nor on a profile is created without controller options.");
-        Assert.AreEqual(1, windows.Split("->CreateCoreWebView2ControllerWithOptions(").Length - 1,
-            "Every view, a popup target included, selects its profile and its private mode in one place.");
+        Assert.AreEqual(2, windows.Split("->CreateCoreWebView2ControllerWithOptions(").Length - 1,
+            "Every view, a popup target included, selects its profile and its private mode in one place; the hidden popup sink of a filtered view is the only other controller.");
+        // A popup sink takes the opener's profile and private mode, as put_NewWindow requires.
+        StringAssert.Contains(windows, "result = profile->get_IsInPrivateModeEnabled(&in_private);");
+        StringAssert.Contains(windows, "result = options->put_IsInPrivateModeEnabled(in_private);");
     }
 
     [TestMethod]
