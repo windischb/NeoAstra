@@ -1,6 +1,7 @@
 #pragma once
 
 #include "neoastra.h"
+#include "request_filter.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -150,7 +152,7 @@ struct neoastra_buffer final : neo_ref_counted {
 
 struct neoastra_stream final : neo_ref_counted { };
 
-enum class neo_operation_state : uint32_t { pending, cancel_requested, completed };
+enum class neo_operation_state : uint32_t { pending, cancel_requested, completed, committed };
 
 struct neoastra_operation final : neo_ref_counted {
     std::atomic<neo_operation_state> state{neo_operation_state::pending};
@@ -158,6 +160,13 @@ struct neoastra_operation final : neo_ref_counted {
     void cancel() noexcept {
         auto expected = neo_operation_state::pending;
         state.compare_exchange_strong(expected, neo_operation_state::cancel_requested, std::memory_order_acq_rel);
+    }
+
+    // A side effect with a defined local installation point wins over cancellation
+    // arriving after this CAS. Existing operations need not use this state.
+    bool try_commit() noexcept {
+        auto expected = neo_operation_state::pending;
+        return state.compare_exchange_strong(expected, neo_operation_state::committed, std::memory_order_acq_rel);
     }
 
     bool try_complete(neoastra_result_t requested, neoastra_result_t& actual) noexcept {
@@ -621,6 +630,8 @@ private:
     void on_zero_references() noexcept override;
 };
 
+struct neo_request_filter_completion;
+
 struct neoastra_view final : neo_ui_ref_counted {
     neoastra_environment_t* environment{};
     neoastra_profile_t* profile{};
@@ -640,6 +651,10 @@ struct neoastra_view final : neo_ui_ref_counted {
     uint32_t maximum_message_size{NEOASTRA_HARD_MAXIMUM_MESSAGE_SIZE};
     neoastra_bridge_policy_t bridge_policy{NEOASTRA_BRIDGE_DISABLED};
     std::vector<std::string> bridge_origins;
+    // Snapshot loads/stores use atomic shared_ptr operations; request callbacks
+    // may run off the UI thread. The installation queue is UI-thread-only.
+    std::shared_ptr<const neo_request_filter::filter> request_filter;
+    std::deque<neo_request_filter_completion*> request_filter_queue;
     // UI-thread-only: NEOASTRA_VIEW_SETTING_HISTORY_NAVIGATION is off.
     bool history_navigation_disabled{};
     neo_callback_slot<neoastra_event_callback_t> events;
@@ -1113,6 +1128,22 @@ neoastra_result_t neo_platform_window_at(neoastra_app_t* app, neoastra_point_t p
 neoastra_result_t neo_platform_view_convert_point(neoastra_view_t* view, bool to_screen, double x, double y, double* out_x, double* out_y) noexcept;
 
 using neo_platform_created_callback_t = void (*)(void* context, neoastra_error_t* error) noexcept;
+// Prepared data owns no view. Installation is synchronous on the UI thread;
+// failure must be reported, and the common layer tears down an uncertain view.
+struct neo_prepared_request_filter {
+    virtual ~neo_prepared_request_filter() = default;
+    virtual neoastra_result_t install(neoastra_view_t*, neoastra_error_t**) noexcept = 0;
+};
+using neo_request_filter_prepared_callback_t = void (*)(void*, std::unique_ptr<neo_prepared_request_filter>, neoastra_result_t, neoastra_error_t*) noexcept;
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t*) noexcept;
+// On accepted preparation, callback runs exactly once ON THE UI THREAD and
+// receives owned prepared/error objects. It may run inline. Rejection calls none.
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t*, const neo_request_filter::filter&,
+    neo_request_filter_prepared_callback_t, void*, neoastra_error_t**) noexcept;
+// On success these consume the operation's initial reference; on error the caller retains it.
+neoastra_result_t neo_start_request_filter(neoastra_view_t*, std::shared_ptr<const neo_request_filter::filter>,
+    neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t**) noexcept;
+void neo_abort_request_filters(neoastra_view_t*) noexcept;
 bool neo_platform_environment_create_async(neoastra_environment_t* environment, const neoastra_environment_options_t* options, neo_platform_created_callback_t callback, void* context, neoastra_error_t** error) noexcept;
 void neo_platform_environment_destroy(neoastra_environment_t* environment) noexcept;
 bool neo_platform_profile_create(neoastra_profile_t* profile, neoastra_error_t** error) noexcept;

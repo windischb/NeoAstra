@@ -138,6 +138,8 @@ public enum NeoCapability
     /// Where it is not supported, such a script is refused, never given to the page.
     /// </summary>
     ScriptWorldChannel,
+    /// <summary>Declarative per-view request refusal; <see cref="NeoRequestFilterFlags"/> describes the backend's coverage.</summary>
+    RequestFilter,
 }
 
 /// <summary>Identifies a backend-specific borrowed native handle.</summary>
@@ -516,6 +518,10 @@ public sealed record NeoRuntimeInfo(string BackendName, string BackendVersion, s
     // Whether the native library reads the binding of a script (version 2 of its options), has neoastra_view_post_script_message,
     // and knows NEOASTRA_CAPABILITY_SCRIPT_WORLD_CHANNEL. A library without it refuses those options as invalid.
     internal bool HasScriptWorldChannels => (BuildFeatures & ScriptWorldChannel) != 0;
+
+    // The filter export and V2 view options exist, independently of backend coverage.
+    private const ulong RequestFilter = 1UL << 6;
+    internal bool HasRequestFilters => (BuildFeatures & RequestFilter) != 0;
 
     // Whether the native library knows NEOASTRA_CAPABILITY_VIEW_PLACEMENT and has the exports of placed views, which came with the channel.
     internal bool HasViewPlacement => HasScriptWorldChannels;

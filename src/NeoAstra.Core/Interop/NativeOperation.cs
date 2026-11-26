@@ -10,6 +10,7 @@ internal sealed class NativeOperation<T>
     private readonly object _sync = new();
     private readonly TaskCompletionSource<T> _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly CancellationToken _cancellationToken;
+    private readonly bool _waitForNativeCancellation;
     private CancellationTokenRegistration _cancellationRegistration;
     private GCHandle _context;
     private SafeOperationHandle? _operation;
@@ -17,8 +18,14 @@ internal sealed class NativeOperation<T>
     private int _managedCompleted;
 
     internal NativeOperation(CancellationToken cancellationToken, object? owner = null)
+        : this(cancellationToken, owner, waitForNativeCancellation: false)
+    {
+    }
+
+    internal NativeOperation(CancellationToken cancellationToken, object? owner, bool waitForNativeCancellation)
     {
         _cancellationToken = cancellationToken;
+        _waitForNativeCancellation = waitForNativeCancellation;
         Owner = owner;
         _context = GCHandle.Alloc(this);
         if (cancellationToken.CanBeCanceled)
@@ -86,6 +93,8 @@ internal sealed class NativeOperation<T>
 
     internal void FailStart(Exception exception) => FinishNative(() => _completion.TrySetException(exception));
 
+    internal void CancelFromNative() => FinishNative(() => _completion.TrySetCanceled(_cancellationToken));
+
     private void Cancel()
     {
         SafeOperationHandle? operation;
@@ -94,7 +103,7 @@ internal sealed class NativeOperation<T>
             operation = _operation;
         }
 
-        if (Interlocked.CompareExchange(ref _managedCompleted, 1, 0) == 0)
+        if (!_waitForNativeCancellation && Interlocked.CompareExchange(ref _managedCompleted, 1, 0) == 0)
         {
             _completion.TrySetCanceled(_cancellationToken);
         }

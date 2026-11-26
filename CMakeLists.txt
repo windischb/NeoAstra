@@ -63,14 +63,22 @@ if(NEOASTRA_BUILD_SHARED)
   set(_neo_library_type SHARED)
 endif()
 
-add_library(neoastra_native ${_neo_library_type}
+set(neoastra_common_sources
   native/src/common/neoastra.cpp
-)
+  native/src/common/request_filter.cpp
+  native/src/common/request_filter_operation.cpp)
+set(neoastra_common_libraries neoastra_sanitizers)
+if(WIN32)
+  list(APPEND neoastra_common_libraries ws2_32)
+endif()
+add_library(neoastra_native ${_neo_library_type} ${neoastra_common_sources})
+# Backends without their own request filter report no coverage and refuse nonempty filters.
+target_sources(neoastra_native PRIVATE native/src/common/request_filter_unsupported.cpp)
 target_compile_definitions(neoastra_native PRIVATE NEOASTRA_BUILD=1)
 target_include_directories(neoastra_native PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(neoastra_native PRIVATE neoastra_sanitizers)
+target_link_libraries(neoastra_native PRIVATE ${neoastra_common_libraries})
 set_target_properties(neoastra_native PROPERTIES
   OUTPUT_NAME neoastra_native
   VERSION ${PROJECT_VERSION}
@@ -180,11 +188,16 @@ if(NEOASTRA_BUILD_TESTS)
   target_include_directories(neoastra_common_tests PRIVATE native/include native/src/common)
   target_link_libraries(neoastra_common_tests PRIVATE neoastra_native neoastra_sanitizers)
   add_test(NAME neoastra_common_tests COMMAND neoastra_common_tests)
+  add_executable(neoastra_request_filter_tests
+    native/tests/request_filter_tests.cpp native/src/common/request_filter.cpp)
+  target_include_directories(neoastra_request_filter_tests PRIVATE native/include native/src/common)
+  target_link_libraries(neoastra_request_filter_tests PRIVATE ${neoastra_common_libraries})
+  add_test(NAME neoastra_request_filter_tests COMMAND neoastra_request_filter_tests)
   # Exercise completion rejection/shutdown without a browser runtime or GUI loop.
   add_executable(neoastra_completion_tests
     native/tests/completion_tests.cpp
     native/tests/completion_test_backend.cpp
-    native/src/common/neoastra.cpp)
+    ${neoastra_common_sources})
   target_include_directories(neoastra_completion_tests PRIVATE native/include native/src/common)
   target_compile_definitions(neoastra_completion_tests PRIVATE NEOASTRA_BUILD=1)
   if(MSVC)
@@ -194,13 +207,13 @@ if(NEOASTRA_BUILD_TESTS)
   endif()
   # The test compiles the common source itself, so it links the thread library that neoastra_native gets from its backend.
   find_package(Threads REQUIRED)
-  target_link_libraries(neoastra_completion_tests PRIVATE neoastra_sanitizers Threads::Threads)
+  target_link_libraries(neoastra_completion_tests PRIVATE ${neoastra_common_libraries} Threads::Threads)
   add_test(NAME neoastra_completion_tests COMMAND neoastra_completion_tests)
   # The protected channel of an isolated-world script through the common layer, with the same recording backend.
   add_executable(neoastra_script_world_tests
     native/tests/script_world_tests.cpp
     native/tests/completion_test_backend.cpp
-    native/src/common/neoastra.cpp)
+    ${neoastra_common_sources})
   target_include_directories(neoastra_script_world_tests PRIVATE native/include native/src/common)
   target_compile_definitions(neoastra_script_world_tests PRIVATE NEOASTRA_BUILD=1)
   if(MSVC)
@@ -208,8 +221,16 @@ if(NEOASTRA_BUILD_TESTS)
   else()
     target_compile_options(neoastra_script_world_tests PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  target_link_libraries(neoastra_script_world_tests PRIVATE neoastra_sanitizers Threads::Threads)
+  target_link_libraries(neoastra_script_world_tests PRIVATE ${neoastra_common_libraries} Threads::Threads)
   add_test(NAME neoastra_script_world_tests COMMAND neoastra_script_world_tests)
+  add_executable(neoastra_request_filter_operation_tests
+    native/tests/request_filter_operation_tests.cpp
+    native/tests/completion_test_backend.cpp
+    ${neoastra_common_sources})
+  target_include_directories(neoastra_request_filter_operation_tests PRIVATE native/include native/src/common)
+  target_compile_definitions(neoastra_request_filter_operation_tests PRIVATE NEOASTRA_BUILD=1)
+  target_link_libraries(neoastra_request_filter_operation_tests PRIVATE ${neoastra_common_libraries} Threads::Threads)
+  add_test(NAME neoastra_request_filter_operation_tests COMMAND neoastra_request_filter_operation_tests)
   add_executable(neoastra_stress_tests native/tests/stress_tests.cpp)
   target_include_directories(neoastra_stress_tests PRIVATE native/include native/src/common)
   target_link_libraries(neoastra_stress_tests PRIVATE neoastra_native neoastra_sanitizers)

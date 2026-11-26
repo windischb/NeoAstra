@@ -523,6 +523,14 @@ public sealed class NeoAstraOptions
     /// <summary>Gets or sets which engine-provided browser features the view keeps.</summary>
     public NeoBrowserFeatures BrowserFeatures { get; set; } = new();
 
+    /// <summary>Gets or sets the initial request filter, installed before the view is published and before its first navigation.</summary>
+    /// <remarks>
+    /// Null means no filter for a regular view, or inheritance from the opener for a tracked popup.
+    /// Use <see cref="NeoRequestFilter.Empty"/> to explicitly disable inheritance. Inputs are snapshotted at creation.
+    /// Missing backend coverage fails creation rather than silently ignoring a nonempty filter.
+    /// </remarks>
+    public NeoRequestFilter? RequestFilter { get; set; }
+
     internal void Validate(NeoEnvironment environment)
     {
         if (Profile is not null && !ReferenceEquals(Profile.Environment, environment))

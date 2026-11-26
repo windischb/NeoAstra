@@ -17,6 +17,14 @@ uint32_t script_message_calls{};
 std::string last_script_message_identifier;
 std::string last_script_message;
 bool script_worlds_supported{};
+uint64_t filter_flags{};
+uint32_t filter_installs{}, filter_prepared_destroyed{};
+neoastra_result_t filter_install_result{NEOASTRA_OK};
+bool reject_filter_start{};
+std::function<void()> filter_install_hook;
+std::deque<std::pair<neo_request_filter_prepared_callback_t, void*>> filter_sources;
+std::shared_ptr<const neo_request_filter::filter> initial_filter;
+uint32_t view_options_version{};
 }
 
 bool neo_platform_initialize(neoastra_app_t*, neoastra_error_t**) noexcept { return true; }
@@ -63,10 +71,42 @@ neoastra_result_t neo_platform_profile_get_cookies(neoastra_profile_t*, const st
 neoastra_result_t neo_platform_profile_set_cookie(neoastra_profile_t*, const neoastra_cookie_t*, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t**) noexcept { return NEOASTRA_ERROR_NOT_SUPPORTED; }
 neoastra_result_t neo_platform_profile_delete_cookie(neoastra_profile_t*, const neoastra_cookie_t*, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t**) noexcept { return NEOASTRA_ERROR_NOT_SUPPORTED; }
 neoastra_result_t neo_platform_profile_clear_data(neoastra_profile_t*, neoastra_data_kind_t, int64_t, int64_t, neoastra_completion_callback_t, void*, neoastra_operation_t*, neoastra_error_t**) noexcept { return NEOASTRA_ERROR_NOT_SUPPORTED; }
-bool neo_platform_view_create_async(neoastra_view_t*, const neoastra_view_options_t*, neo_platform_created_callback_t callback, void* context, neoastra_error_t**) noexcept {
+bool neo_platform_view_create_async(neoastra_view_t* view, const neoastra_view_options_t* options, neo_platform_created_callback_t callback, void* context, neoastra_error_t**) noexcept {
     completion_test_backend::view_callback = callback;
     completion_test_backend::view_context = context;
+    completion_test_backend::initial_filter = std::atomic_load(&view->request_filter);
+    completion_test_backend::view_options_version = options->version;
     return true;
+}
+
+namespace completion_test_backend {
+struct prepared_filter final : neo_prepared_request_filter {
+    ~prepared_filter() override { ++filter_prepared_destroyed; }
+    neoastra_result_t install(neoastra_view_t*, neoastra_error_t** error) noexcept override {
+        ++filter_installs;
+        if (filter_install_hook) filter_install_hook();
+        return filter_install_result == NEOASTRA_OK ? NEOASTRA_OK
+            : neo_fail(error, filter_install_result, "Test filter installation failed");
+    }
+};
+
+void finish_filter(neoastra_result_t result) {
+    auto [callback, context] = filter_sources.front();
+    filter_sources.pop_front();
+    neoastra_error_t* error{};
+    if (result != NEOASTRA_OK) neo_fail(&error, result, "Test preparation failed");
+    callback(context, result == NEOASTRA_OK ? std::make_unique<prepared_filter>() : nullptr, result, error);
+}
+}
+
+uint64_t neo_platform_request_filter_flags(const neoastra_environment_t*) noexcept { return completion_test_backend::filter_flags; }
+neoastra_result_t neo_platform_prepare_request_filter(neoastra_view_t*, const neo_request_filter::filter&,
+    neo_request_filter_prepared_callback_t callback, void* context, neoastra_error_t** error) noexcept {
+    if (completion_test_backend::reject_filter_start)
+        return neo_fail(error, NEOASTRA_ERROR_NOT_SUPPORTED, "Test backend refused preparation");
+    try { completion_test_backend::filter_sources.emplace_back(callback, context); }
+    catch (...) { return neo_fail(error, NEOASTRA_ERROR_NATIVE_FAILURE, "Test queue allocation failed"); }
+    return NEOASTRA_OK;
 }
 void neo_platform_view_destroy(neoastra_view_t*) noexcept { ++completion_test_backend::views_destroyed; }
 neoastra_result_t neo_platform_view_set_bounds(neoastra_view_t*) noexcept { return NEOASTRA_OK; }

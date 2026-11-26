@@ -43,10 +43,16 @@ public sealed class NeoAstra : IAsyncDisposable
     private bool _canGoBack;
     private bool _canGoForward;
     private bool _historyNavigationOff;
+    private NeoRequestFilter _requestFilter = NeoRequestFilter.Empty;
     private int _disposed;
     private object? _rpcServiceScope;
 
     internal NeoAstra(NeoEnvironment environment, SafeViewHandle handle, NeoAstraHost host, NeoAstraOptions options)
+        : this(environment, handle, host, options, NeoRequestFilter.Empty)
+    {
+    }
+
+    internal NeoAstra(NeoEnvironment environment, SafeViewHandle handle, NeoAstraHost host, NeoAstraOptions options, NeoRequestFilter requestFilter)
     {
         Environment = environment;
         _handle = handle;
@@ -57,6 +63,7 @@ public sealed class NeoAstra : IAsyncDisposable
         _decisionTimeout = options.DecisionTimeout;
         _viewLabel = options.ViewLabel;
         Profile = options.Profile;
+        _requestFilter = requestFilter;
         TransportLimits = (options.MaximumMessageSize, options.Transport.MaximumJsonDepth);
         _postsBatches = environment.RuntimeInfo.PostsMessageBatches;
         RegisterEventCallback();
@@ -93,6 +100,125 @@ public sealed class NeoAstra : IAsyncDisposable
     /// <summary>Gets whether forward history navigation is available.</summary>
     /// <remarks>It is <see langword="false"/> while <see cref="NeoBrowserFeatures.HistoryNavigation"/> is off for the view.</remarks>
     public bool CanGoForward => _canGoForward && !_historyNavigationOff;
+
+    /// <summary>Gets the immutable snapshot last installed through the native API, or <see cref="NeoRequestFilter.Empty"/>.</summary>
+    /// <remarks>This is not an acknowledgement that every browser process has adopted the snapshot.</remarks>
+    /// <exception cref="ObjectDisposedException">The view has been disposed.</exception>
+    public NeoRequestFilter RequestFilter
+    {
+        get { ThrowIfDisposed(); return Volatile.Read(ref _requestFilter); }
+    }
+
+    /// <summary>Replaces the request filter, preserving the backend's advertised coverage and view isolation.</summary>
+    /// <param name="filter">The new rules, or <see cref="NeoRequestFilter.Empty"/> to remove them.</param>
+    /// <returns>A task completed after local native installation, not a global engine-process barrier.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
+    /// <exception cref="ArgumentException">The rules or requirement flags are invalid.</exception>
+    /// <exception cref="NotSupportedException">The library or backend lacks the required filter coverage.</exception>
+    /// <exception cref="ObjectDisposedException">The view or application has been disposed.</exception>
+    /// <exception cref="NeoAstraException">Compilation or installation failed.</exception>
+    public Task SetRequestFilterAsync(NeoRequestFilter filter) => SetRequestFilterAsync(filter, CancellationToken.None);
+
+    /// <summary>Replaces the request filter. Calls from any thread are queued on the UI dispatcher.</summary>
+    /// <param name="filter">The new rules, or <see cref="NeoRequestFilter.Empty"/> to remove them.</param>
+    /// <param name="cancellationToken">Prevents installation if cancellation wins before the native local installation point. Otherwise the native result wins.</param>
+    /// <returns>A task completed after local native installation. Engine-process propagation may still be in progress.</returns>
+    /// <remarks>
+    /// Inputs are snapshotted before dispatch; native installations are ordered per view.
+    /// No zero-TCP guarantee, fixed propagation delay, or termination of in-flight requests is promised.
+    /// Preparation errors preserve the previous filter; an uncertain native installation failure may close the view.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
+    /// <exception cref="ArgumentException">The rules or requirement flags are invalid.</exception>
+    /// <exception cref="NotSupportedException">The library or backend lacks the required filter coverage.</exception>
+    /// <exception cref="OperationCanceledException">Cancellation prevented installation, or application shutdown canceled the operation.</exception>
+    /// <exception cref="ObjectDisposedException">The view or application has been disposed.</exception>
+    /// <exception cref="NeoAstraException">Compilation or installation failed.</exception>
+    public Task SetRequestFilterAsync(NeoRequestFilter filter, CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(filter);
+        cancellationToken.ThrowIfCancellationRequested();
+        var snapshot = NeoRequestFilter.CreateSnapshot(filter);
+        return DispatchRequestFilterAsync(snapshot, cancellationToken);
+    }
+
+    private async Task DispatchRequestFilterAsync(NeoRequestFilter snapshot, CancellationToken cancellationToken)
+    {
+        // Always dispatch, even on the UI thread: a direct fast path could overtake
+        // a setter already posted by another thread.
+        var pending = await Environment.Application.Dispatcher.InvokeAsync(
+            () => StartRequestFilter(snapshot, cancellationToken), cancellationToken).ConfigureAwait(false);
+        await pending.ConfigureAwait(false);
+    }
+
+    internal static Exception? CheckRequestFilterSupport(NeoRuntimeInfo runtime, NeoRequestFilter snapshot)
+        => snapshot.Rules.Count != 0 && !runtime.HasRequestFilters
+            ? new NotSupportedException("The loaded native library has no request-filter ABI (NeoCapability.RequestFilter).")
+            : null;
+
+    private unsafe ValueTask<bool> StartRequestFilter(NeoRequestFilter snapshot, CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (CheckRequestFilterSupport(Environment.RuntimeInfo, snapshot) is { } unsupported)
+            return ValueTask.FromException<bool>(unsupported);
+        if (!Environment.RuntimeInfo.HasRequestFilters)
+        {
+            Volatile.Write(ref _requestFilter, snapshot);
+            return ValueTask.FromResult(true); // Empty on an old library: never reference the new export.
+        }
+
+        using var native = new NativeRequestFilter(snapshot);
+        var description = native.Value;
+        var retained = false;
+        try
+        {
+            _handle.DangerousAddRef(ref retained);
+            var operation = new NativeOperation<bool>(cancellationToken, new FilterChange(this, snapshot), waitForNativeCancellation: true);
+            NativeMethods.neoastra_operation_t pending = default;
+            NativeMethods.neoastra_error_t error = default;
+            try
+            {
+                var result = NativeMethods.neoastra_view_set_request_filter_async(
+                    new(_handle.DangerousGetHandle()), &description,
+                    (delegate* unmanaged[Cdecl]<void*, NativeMethods.neoastra_result_t, NativeMethods.neoastra_error_t, void>)&RequestFilterInstalled,
+                    (void*)operation.Context, &pending, &error);
+                if (NativeError.Code(result) == NeoErrorCode.Success) operation.AttachOperation(pending.Handle);
+                else
+                {
+                    var failure = NativeError.Read(NativeError.Code(result), error.Handle);
+                    operation.FailStart(NativeError.CreateException(failure, "set request filter", cancellationToken));
+                }
+            }
+            catch (Exception exception) { operation.FailStart(exception); }
+            finally { if (error.Handle != 0) new SafeErrorHandle(error.Handle).Dispose(); }
+            return operation.ValueTask;
+        }
+        finally { if (retained) _handle.DangerousRelease(); }
+    }
+
+    private sealed record FilterChange(NeoAstra View, NeoRequestFilter Filter);
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static unsafe void RequestFilterInstalled(void* context, NativeMethods.neoastra_result_t result, NativeMethods.neoastra_error_t error)
+    {
+        var operation = NativeOperation.Get<bool>(context);
+        if (operation is null) return;
+        try
+        {
+            var code = NativeError.Code(result);
+            if (code == NeoErrorCode.Success)
+            {
+                var change = (FilterChange)operation.Owner!;
+                Volatile.Write(ref change.View._requestFilter, change.Filter);
+                operation.Complete(true);
+            }
+            else if (code == NeoErrorCode.Canceled) operation.CancelFromNative();
+            else operation.Fail(NativeError.CreateException(NativeError.Read(code, error.Handle), "set request filter"));
+        }
+        catch (Exception exception) { operation.Fail(exception); }
+    }
 
     /// <summary>Gets or sets the page zoom factor, where <c>1.0</c> is 100 percent.</summary>
     /// <remarks>
