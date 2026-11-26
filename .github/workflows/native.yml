@@ -64,6 +64,31 @@ jobs:
           cmake --build --preset macos-x64-asan-ubsan
           ctest --preset macos-x64-asan-ubsan
 
+  # The tests labelled browser (the Windows request-filter suites) run real traffic through the WebView2 runtime of the
+  # runner, a newer one than the runtime they were verified on, for several minutes. They report without failing the
+  # workflow until their stability on hosted runners is known.
+  windows-browser:
+    name: Browser tests (win-x64, WebView2)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+      - name: Set up Clang
+        uses: ./.github/actions/setup-windows-clang
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: WebView2 runtime version
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $version = (Get-ItemProperty -Path $key -Name pv -ErrorAction SilentlyContinue).pv
+          "WebView2 Runtime: $($version ?? 'not found')" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+      - name: Build and run the browser tests
+        shell: bash
+        run: python eng/build_native.py --rid win-x64 --clean --browser-tests
+
   # StoreKit 2 is a Swift API: the purchases plugin embeds this bridge into iOS applications, checked in under
   # src/NeoAstra.Purchases/xcframework like the native libraries.
   purchases-bridge:

@@ -83,6 +83,11 @@ def main() -> int:
     parser.add_argument("--rid", required=True, choices=sorted(RIDS))
     parser.add_argument("--skip-tests", action="store_true", help="Skip tests for a cross-compiled target")
     parser.add_argument("--clean", action="store_true", help="Remove the RID build directory before configuring")
+    parser.add_argument(
+        "--browser-tests",
+        action="store_true",
+        help="Run only the tests labelled browser (long runs through the installed web engine), which are left out otherwise",
+    )
     args = parser.parse_args()
 
     preset, library_name = RIDS[args.rid]
@@ -96,7 +101,8 @@ def main() -> int:
     run("cmake", "--preset", preset, "-B", str(build_directory))
     run("cmake", "--build", str(build_directory), "--config", "Release")
     if not args.skip_tests and args.rid not in MOBILE_RIDS:
-        run("ctest", "--test-dir", str(build_directory), "--build-config", "Release", "--output-on-failure", "--no-tests=error")
+        labels = ["--label-regex", "^browser$"] if args.browser_tests else ["--label-exclude", "^browser$"]
+        run("ctest", "--test-dir", str(build_directory), "--build-config", "Release", "--output-on-failure", "--no-tests=error", *labels)
 
     source = build_directory / library_name
     if not source.is_file():
